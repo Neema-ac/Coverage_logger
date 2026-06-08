@@ -6,10 +6,22 @@ import pandas as pd
 import re
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from fpdf import FPDF
 import base64
 from io import BytesIO
 import json
+
+# Try to import PDF libraries with fallback
+try:
+    from reportlab.lib import colors
+    from reportlab.lib.pagesizes import letter
+    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, PageBreak
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+    from reportlab.lib.units import inch
+    from reportlab.pdfgen import canvas
+    PDF_AVAILABLE = True
+except ImportError:
+    PDF_AVAILABLE = False
+    st.warning("PDF export will be available after installing reportlab")
 
 st.set_page_config(page_title="Company Sentiment Analyzer", layout="wide")
 
@@ -32,10 +44,16 @@ st.markdown("""
     margin: 0.5rem 0;
     font-size: 0.9rem;
 }
-.highlight {
+.keyword-highlight {
     background-color: #fff3cd;
-    padding: 0.2rem;
+    padding: 0.2rem 0.3rem;
     border-radius: 3px;
+    font-family: monospace;
+}
+.stMetric {
+    background-color: #f8f9fa;
+    padding: 1rem;
+    border-radius: 10px;
 }
 </style>
 """, unsafe_allow_html=True)
@@ -107,29 +125,28 @@ class EnhancedCompanyAnalyzer:
     
     def extract_title(self, soup):
         """Extract article title from webpage"""
-        # Try multiple methods to get title
         title = None
         
         # Method 1: Standard title tag
-        if soup.title:
-            title = soup.title.string
+        if soup.title and soup.title.string:
+            title = soup.title.string.strip()
         
         # Method 2: Open Graph title
         if not title:
             og_title = soup.find('meta', property='og:title')
-            if og_title:
-                title = og_title.get('content', '')
+            if og_title and og_title.get('content'):
+                title = og_title.get('content').strip()
         
         # Method 3: H1 tag
         if not title:
             h1 = soup.find('h1')
             if h1:
-                title = h1.get_text()
+                title = h1.get_text().strip()
         
         # Clean up title
         if title:
-            title = re.sub(r'\s+', ' ', title).strip()
-            title = title[:100]  # Limit length
+            title = re.sub(r'\s+', ' ', title)
+            title = title[:100]
         
         return title or "Untitled Article"
     
@@ -158,7 +175,7 @@ class EnhancedCompanyAnalyzer:
             
             # Extract key sentences (for explainability)
             sentences = re.split(r'[.!?]+', text)
-            key_sentences = [s.strip() for s in sentences if len(s.strip()) > 50][:20]
+            key_sentences = [s.strip() for s in sentences if len(s.strip()) > 60][:10]
             
             return {
                 'text': text[:8000],
@@ -170,7 +187,7 @@ class EnhancedCompanyAnalyzer:
         except Exception as e:
             return {
                 'text': '',
-                'title': f"Error: {url}",
+                'title': f"Error: Could not fetch {url}",
                 'key_sentences': [],
                 'url': url,
                 'error': str(e)
@@ -194,7 +211,6 @@ class EnhancedCompanyAnalyzer:
         # Find key phrases that influenced sentiment
         text_lower = text.lower()
         
-        # Check for positive/negative indicators
         positive_phrases = [p for p in self.positive_indicators if p in text_lower]
         negative_phrases = [n for n in self.negative_indicators if n in text_lower]
         
@@ -202,19 +218,19 @@ class EnhancedCompanyAnalyzer:
         key_phrases = []
         
         if sentiment == 'positive':
-            explanation = f"The content shows positive sentiment with {confidence:.1%} confidence. "
+            explanation = f"The content shows POSITIVE sentiment with {confidence:.1%} confidence. "
             if positive_phrases:
-                explanation += f"Key positive indicators found: {', '.join(positive_phrases[:3])}. "
-                key_phrases.extend(positive_phrases[:3])
+                explanation += f"Key positive indicators found: {', '.join(positive_phrases[:4])}. "
+                key_phrases.extend(positive_phrases[:4])
             if negative_phrases:
                 explanation += f"Some negative indicators present but outweighed by positive content."
         elif sentiment == 'negative':
-            explanation = f"The content shows negative sentiment with {confidence:.1%} confidence. "
+            explanation = f"The content shows NEGATIVE sentiment with {confidence:.1%} confidence. "
             if negative_phrases:
-                explanation += f"Key negative indicators found: {', '.join(negative_phrases[:3])}. "
-                key_phrases.extend(negative_phrases[:3])
+                explanation += f"Key negative indicators found: {', '.join(negative_phrases[:4])}. "
+                key_phrases.extend(negative_phrases[:4])
         else:
-            explanation = f"The content shows neutral sentiment (confidence: {confidence:.1%}). "
+            explanation = f"The content shows NEUTRAL sentiment (confidence: {confidence:.1%}). "
             explanation += "No strong positive or negative indicators detected."
         
         return {
@@ -247,18 +263,18 @@ class EnhancedCompanyAnalyzer:
                     'description': config['description']
                 })
                 explanation_parts.append(
-                    f"• {pillar.replace('_', ' ').title()}: Found keywords {', '.join(matched_keywords[:3])}"
+                    f"• {pillar.replace('_', ' ').title()}: Found keywords '{', '.join(matched_keywords[:2])}'"
                 )
         
         if len(matches) >= 2:
             status = 'YES'
-            explanation = f"Strong alignment detected! {len(matches)} core positioning pillars found:\n" + "\n".join(explanation_parts)
+            explanation = f"✅ STRONG ALIGNMENT detected! Matched {len(matches)} core positioning pillars:\n" + "\n".join(explanation_parts)
         elif len(matches) == 1:
             status = 'PARTIAL'
-            explanation = f"Partial alignment detected. Found 1 core positioning pillar:\n" + "\n".join(explanation_parts)
+            explanation = f"🟡 PARTIAL ALIGNMENT detected. Matched 1 core positioning pillar:\n" + "\n".join(explanation_parts)
         else:
             status = 'NO'
-            explanation = "No alignment with core positioning pillars detected. The content doesn't mention frontier investment, climate finances, or energy access."
+            explanation = "❌ NO ALIGNMENT detected. The content doesn't mention frontier investment, climate finances, or energy access."
         
         return {
             'status': status,
@@ -282,7 +298,7 @@ class EnhancedCompanyAnalyzer:
                     'outcome': outcome,
                     'keywords': matched_keywords,
                     'description': config['description'],
-                    'confidence': len(matched_keywords) / len(config['keywords']) * 100
+                    'confidence': min(len(matched_keywords) / len(config['keywords']) * 100, 100)
                 })
         
         # Sort by confidence
@@ -294,17 +310,16 @@ class EnhancedCompanyAnalyzer:
                 'outcome': 'Investor Narrative',
                 'keywords': [],
                 'description': 'Strengthens investor confidence or fundraising narrative',
-                'confidence': 60,
-                'explanation': 'High alignment and positive sentiment suggest investor narrative potential.'
+                'confidence': 60
             }]
         
         # Generate explanation
         if top_outcomes:
             outcome_names = [o['outcome'] for o in top_outcomes]
-            explanation = f"Identified {len(top_outcomes)} potential business outcomes: {', '.join(outcome_names)}. "
+            explanation = f"Identified {len(top_outcomes)} potential business outcome(s): {', '.join(outcome_names)}. "
             for outcome in top_outcomes:
                 if outcome['keywords']:
-                    explanation += f"\n• {outcome['outcome']}: Found keywords {', '.join(outcome['keywords'][:3])}"
+                    explanation += f"\n• {outcome['outcome']}: Found keywords '{', '.join(outcome['keywords'][:3])}'"
         else:
             explanation = "No specific business outcomes identified from the content."
         
@@ -346,15 +361,15 @@ class EnhancedCompanyAnalyzer:
             'sentiment': sentiment,
             'alignment': alignment,
             'outcomes': outcomes,
-            'key_sentences': page_data['key_sentences'][:5],  # Top 5 sentences for context
-            'text_preview': page_data['text'][:500] + "..."
+            'key_sentences': page_data['key_sentences'][:5],
+            'text_preview': page_data['text'][:300] + "..."
         }
     
     # Sentiment indicators
     positive_indicators = [
         "success", "achievement", "milestone", "growth", "expansion",
         "launch", "breakthrough", "innovation", "leadership", "excellent",
-        "sustainable", "positive", "opportunity", "benefit"
+        "sustainable", "positive", "opportunity", "benefit", "award"
     ]
     
     negative_indicators = [
@@ -363,89 +378,123 @@ class EnhancedCompanyAnalyzer:
         "challenge", "concern", "issue"
     ]
 
-class PDFReport(FPDF):
-    """Custom PDF report generator"""
-    
-    def header(self):
-        self.set_font('Arial', 'B', 12)
-        self.cell(0, 10, 'Company Image Sentiment Analysis Report', 0, 1, 'C')
-        self.set_font('Arial', '', 10)
-        self.cell(0, 5, f'Generated: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}', 0, 1, 'C')
-        self.ln(5)
-    
-    def footer(self):
-        self.set_y(-15)
-        self.set_font('Arial', 'I', 8)
-        self.cell(0, 10, f'Page {self.page_no()}', 0, 0, 'C')
-    
-    def add_analysis_section(self, result):
-        """Add analysis section for a single URL"""
-        # Title
-        self.set_font('Arial', 'B', 11)
-        self.set_fill_color(102, 126, 234)
-        self.set_text_color(255, 255, 255)
-        self.cell(0, 10, f"Article: {result['title'][:80]}", 0, 1, 'L', 1)
-        self.set_text_color(0, 0, 0)
+def create_html_report(results):
+    """Create HTML report for PDF conversion"""
+    html_content = f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <meta charset="UTF-8">
+        <title>Sentiment Analysis Report</title>
+        <style>
+            body {{ font-family: Arial, sans-serif; margin: 40px; line-height: 1.6; }}
+            h1 {{ color: #667eea; border-bottom: 2px solid #667eea; padding-bottom: 10px; }}
+            h2 {{ color: #764ba2; margin-top: 30px; }}
+            h3 {{ color: #333; margin-top: 20px; }}
+            .summary {{ background: #f0f2f6; padding: 20px; border-radius: 10px; margin: 20px 0; }}
+            .article {{ border: 1px solid #ddd; padding: 20px; margin: 20px 0; border-radius: 10px; page-break-inside: avoid; }}
+            .sentiment-positive {{ color: #27ae60; font-weight: bold; }}
+            .sentiment-negative {{ color: #e74c3c; font-weight: bold; }}
+            .sentiment-neutral {{ color: #f39c12; font-weight: bold; }}
+            .alignment-yes {{ color: #27ae60; font-weight: bold; }}
+            .alignment-partial {{ color: #f39c12; font-weight: bold; }}
+            .alignment-no {{ color: #e74c3c; font-weight: bold; }}
+            .explanation {{ background: #f8f9fa; padding: 15px; border-left: 4px solid #667eea; margin: 10px 0; }}
+            .keyword {{ background: #fff3cd; padding: 2px 5px; border-radius: 3px; font-family: monospace; }}
+            .footer {{ text-align: center; margin-top: 50px; padding-top: 20px; border-top: 1px solid #ddd; font-size: 12px; color: #666; }}
+        </style>
+    </head>
+    <body>
+        <h1>🏢 Company Image Sentiment Analysis Report</h1>
+        <p><strong>Generated:</strong> {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}</p>
         
-        # URL
-        self.set_font('Arial', 'I', 9)
-        self.cell(0, 5, f"URL: {result['url']}", 0, 1, 'L')
-        self.ln(3)
+        <div class="summary">
+            <h2>Executive Summary</h2>
+    """
+    
+    successful = [r for r in results if not r.get('error', False)]
+    html_content += f"<p><strong>Total Articles Analyzed:</strong> {len(results)}</p>"
+    html_content += f"<p><strong>Successfully Analyzed:</strong> {len(successful)}</p>"
+    
+    if successful:
+        pos_count = sum(1 for r in successful if r['sentiment']['label'] == 'positive')
+        neg_count = sum(1 for r in successful if r['sentiment']['label'] == 'negative')
+        neu_count = sum(1 for r in successful if r['sentiment']['label'] == 'neutral')
+        aligned_count = sum(1 for r in successful if r['alignment']['status'] == 'YES')
         
-        # Sentiment
-        self.set_font('Arial', 'B', 10)
-        self.set_fill_color(240, 240, 240)
-        self.cell(0, 8, "Sentiment Analysis", 0, 1, 'L', 1)
-        self.set_font('Arial', '', 10)
-        
-        sentiment_color = ''
-        if result['sentiment']['label'] == 'positive':
-            sentiment_color = 'Positive'
-        elif result['sentiment']['label'] == 'negative':
-            sentiment_color = 'Negative'
+        html_content += f"<p><strong>Positive Sentiment:</strong> {pos_count}</p>"
+        html_content += f"<p><strong>Negative Sentiment:</strong> {neg_count}</p>"
+        html_content += f"<p><strong>Neutral Sentiment:</strong> {neu_count}</p>"
+        html_content += f"<p><strong>Strong Alignment:</strong> {aligned_count}</p>"
+    
+    html_content += "</div>"
+    
+    # Individual articles
+    for idx, result in enumerate(results, 1):
+        if result.get('error', False):
+            html_content += f"""
+            <div class="article">
+                <h3>{idx}. {result['title']}</h3>
+                <p><strong>URL:</strong> {result['url']}</p>
+                <p><strong>Status:</strong> ❌ Failed to analyze</p>
+                <p>Could not fetch or parse content.</p>
+            </div>
+            """
         else:
-            sentiment_color = 'Neutral'
-        
-        self.cell(0, 6, f"Result: {sentiment_color.upper()} (Confidence: {result['sentiment']['score']:.1%})", 0, 1, 'L')
-        self.multi_cell(0, 5, f"Explanation: {result['sentiment']['explanation']}")
-        self.ln(3)
-        
-        # Positioning Alignment
-        self.set_font('Arial', 'B', 10)
-        self.cell(0, 8, "Positioning Alignment", 0, 1, 'L', 1)
-        self.set_font('Arial', '', 10)
-        self.cell(0, 6, f"Status: {result['alignment']['status']}", 0, 1, 'L')
-        self.multi_cell(0, 5, f"Explanation: {result['alignment']['explanation']}")
-        self.ln(3)
-        
-        # Business Outcomes
-        self.set_font('Arial', 'B', 10)
-        self.cell(0, 8, "Business Outcomes", 0, 1, 'L', 1)
-        self.set_font('Arial', '', 10)
-        
-        if result['outcomes']['outcomes']:
-            outcomes_list = ', '.join([o['outcome'] for o in result['outcomes']['outcomes']])
-            self.cell(0, 6, f"Identified: {outcomes_list}", 0, 1, 'L')
-        self.multi_cell(0, 5, f"Explanation: {result['outcomes']['explanation']}")
-        self.ln(5)
-        
-        # Key Sentences
-        if result.get('key_sentences'):
-            self.set_font('Arial', 'B', 10)
-            self.cell(0, 8, "Key Excerpts", 0, 1, 'L', 1)
-            self.set_font('Arial', '', 9)
-            for i, sentence in enumerate(result['key_sentences'][:3], 1):
-                self.multi_cell(0, 5, f"{i}. \"{sentence[:200]}...\"")
-            self.ln(5)
-        
-        self.ln(5)
+            sentiment_class = f"sentiment-{result['sentiment']['label']}"
+            alignment_class = f"alignment-{result['alignment']['status'].lower()}"
+            
+            html_content += f"""
+            <div class="article">
+                <h3>{idx}. {result['title']}</h3>
+                <p><strong>URL:</strong> <a href="{result['url']}">{result['url']}</a></p>
+                
+                <h4>🎭 Sentiment Analysis</h4>
+                <div class="explanation">
+                    <p><strong>Result:</strong> <span class="{sentiment_class}">{result['sentiment']['label'].upper()}</span> (Confidence: {result['sentiment']['score']:.1%})</p>
+                    <p><strong>Explanation:</strong> {result['sentiment']['explanation']}</p>
+                </div>
+                
+                <h4>🎯 Positioning Alignment</h4>
+                <div class="explanation">
+                    <p><strong>Status:</strong> <span class="{alignment_class}">{result['alignment']['status']}</span></p>
+                    <p><strong>Explanation:</strong> {result['alignment']['explanation']}</p>
+                </div>
+                
+                <h4>💼 Business Outcomes</h4>
+                <div class="explanation">
+                    <p><strong>Identified:</strong> {', '.join([o['outcome'] for o in result['outcomes']['outcomes']]) if result['outcomes']['outcomes'] else 'None'}</p>
+                    <p><strong>Explanation:</strong> {result['outcomes']['explanation']}</p>
+                </div>
+            """
+            
+            if result.get('key_sentences'):
+                html_content += """
+                <h4>📝 Key Excerpts</h4>
+                <ul>
+                """
+                for sentence in result['key_sentences'][:3]:
+                    html_content += f"<li>\"{sentence[:200]}...\"</li>"
+                html_content += "</ul>"
+            
+            html_content += "</div>"
+    
+    html_content += f"""
+        <div class="footer">
+            <p>Report generated by Company Image Sentiment Analyzer</p>
+        </div>
+    </body>
+    </html>
+    """
+    
+    return html_content
 
 def main():
     # Header
     st.markdown("""
     <div class="big-title">
         <h1>🏢 Company Image Sentiment Analyzer</h1>
-        <p>With AI-powered explanations and detailed PDF reports</p>
+        <p>With AI-powered explanations and detailed reports</p>
     </div>
     """, unsafe_allow_html=True)
     
@@ -465,6 +514,14 @@ def main():
         ✅ **Business Outcomes** identification
         ✅ **PDF Reports** with article titles
         ✅ **Key Excerpts** showing influential content
+        """)
+        st.markdown("---")
+        st.markdown("### 💡 Tips")
+        st.info("""
+        - Expand any result to see detailed explanations
+        - Keywords that influenced results are highlighted
+        - Download CSV for data analysis
+        - Download PDF for client-ready reports
         """)
     
     # Main input
@@ -511,19 +568,65 @@ def main():
         st.session_state.results = results
         
         # Display summary
-        st.success(f"✅ Analysis complete! {len([r for r in results if not r['error']])} URLs successfully analyzed")
+        successful = [r for r in results if not r.get('error', False)]
+        st.success(f"✅ Analysis complete! {len(successful)}/{len(results)} URLs successfully analyzed")
         
         # Display detailed results
         display_detailed_results(results)
         
-        # PDF Export option
+        # Export options
         st.markdown("---")
-        st.markdown("### 📄 Export Report")
+        st.markdown("### 📄 Export Results")
         
-        col1, col2, col3 = st.columns([1, 1, 1])
+        col1, col2, col3 = st.columns(3)
+        
+        with col1:
+            # CSV Export
+            df = pd.DataFrame([{
+                'URL': r['url'],
+                'Title': r['title'],
+                'Status': r['status'],
+                'Sentiment': r['sentiment']['label'].upper() if not r.get('error') else 'ERROR',
+                'Confidence': r['sentiment']['score'] if not r.get('error') else 0,
+                'Alignment': r['alignment']['status'] if not r.get('error') else 'N/A',
+                'Outcomes': ', '.join([o['outcome'] for o in r['outcomes']['outcomes']]) if not r.get('error') and r['outcomes']['outcomes'] else '',
+                'Explanation': r['sentiment']['explanation'] if not r.get('error') else ''
+            } for r in results])
+            
+            csv = df.to_csv(index=False)
+            st.download_button(
+                label="📥 Download CSV",
+                data=csv,
+                file_name=f"sentiment_analysis_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                mime="text/csv",
+                use_container_width=True
+            )
+        
         with col2:
-            if st.button("📥 Download PDF Report", type="primary", use_container_width=True):
-                generate_pdf_report(results)
+            # JSON Export
+            json_data = json.dumps(results, default=str, indent=2)
+            st.download_button(
+                label="📥 Download JSON",
+                data=json_data,
+                file_name=f"sentiment_analysis_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
+                mime="application/json",
+                use_container_width=True
+            )
+        
+        with col3:
+            # HTML/PDF Export - Working version
+            html_report = create_html_report(results)
+            
+            # Provide HTML download (works everywhere)
+            st.download_button(
+                label="📥 Download HTML Report",
+                data=html_report,
+                file_name=f"sentiment_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.html",
+                mime="text/html",
+                use_container_width=True
+            )
+            
+            st.caption("💡 HTML report works in any browser - save as PDF using browser's Print → Save as PDF")
         
     elif analyze_btn and not urls:
         st.warning("⚠️ Please enter at least one URL to analyze")
@@ -541,13 +644,13 @@ def display_detailed_results(results):
     
     col1, col2, col3, col4 = st.columns(4)
     with col1:
-        st.metric("✅ Analyzed", len(successful))
+        st.metric("✅ Successfully Analyzed", len(successful))
     with col2:
         pos_count = sum(1 for r in successful if r['sentiment']['label'] == 'positive')
-        st.metric("😊 Positive", pos_count)
+        st.metric("😊 Positive Sentiment", pos_count)
     with col3:
         aligned = sum(1 for r in successful if r['alignment']['status'] == 'YES')
-        st.metric("🎯 Aligned", aligned)
+        st.metric("🎯 Strong Alignment", aligned)
     with col4:
         avg_confidence = sum(r['sentiment']['score'] for r in successful) / len(successful) if successful else 0
         st.metric("📊 Avg Confidence", f"{avg_confidence:.1%}")
@@ -556,12 +659,15 @@ def display_detailed_results(results):
     
     # Detailed results with expanders
     st.markdown("### 📋 Detailed Analysis Results")
+    st.markdown("*Click on any section below to see detailed explanations*")
     
     for idx, result in enumerate(results, 1):
-        with st.expander(f"{idx}. {result['title'][:80]}", expanded=False):
-            # Status indicator
-            if result['error']:
-                st.error(f"❌ Failed: {result.get('error', 'Unknown error')}")
+        status_icon = "✅" if not result.get('error') else "❌"
+        title_display = result['title'][:80] if len(result['title']) > 80 else result['title']
+        
+        with st.expander(f"{status_icon} {idx}. {title_display}", expanded=False):
+            if result.get('error'):
+                st.error(f"❌ Failed to analyze: {result['title']}")
                 st.code(result['url'])
                 continue
             
@@ -601,6 +707,12 @@ def display_detailed_results(results):
             </div>
             """, unsafe_allow_html=True)
             
+            # Show matched keywords for alignment
+            if result['alignment'].get('matches'):
+                st.markdown("**Matched Keywords:**")
+                for match in result['alignment']['matches']:
+                    st.markdown(f"- {match['pillar'].replace('_', ' ').title()}: `{', '.join(match['keywords'][:3])}`")
+            
             # Business Outcomes Section
             st.markdown("#### 💼 Business Outcomes")
             if result['outcomes']['outcomes']:
@@ -608,10 +720,9 @@ def display_detailed_results(results):
                 outcomes_html += f"<strong>Identified Outcomes:</strong> {', '.join([o['outcome'] for o in result['outcomes']['outcomes']])}<br>"
                 outcomes_html += f"<strong>Explanation:</strong> {result['outcomes']['explanation']}<br>"
                 
-                # Show keyword matches
                 for outcome in result['outcomes']['outcomes']:
                     if outcome.get('keywords'):
-                        outcomes_html += f"<br><strong>{outcome['outcome']}:</strong> Found keywords: {', '.join(outcome['keywords'][:3])}"
+                        outcomes_html += f"<br><strong>{outcome['outcome']}:</strong> Found keywords: `{', '.join(outcome['keywords'][:3])}`"
                 
                 outcomes_html += "</div>"
                 st.markdown(outcomes_html, unsafe_allow_html=True)
@@ -629,60 +740,6 @@ def display_detailed_results(results):
                 for i, sentence in enumerate(result['key_sentences'][:3], 1):
                     st.markdown(f"<div class='explanation-box'><strong>{i}.</strong> \"{sentence[:250]}...\"</div>", 
                                unsafe_allow_html=True)
-
-def generate_pdf_report(results):
-    """Generate and download PDF report"""
-    try:
-        pdf = PDFReport()
-        pdf.add_page()
-        
-        # Add summary section
-        pdf.set_font('Arial', 'B', 14)
-        pdf.cell(0, 10, "Executive Summary", 0, 1, 'L')
-        pdf.set_font('Arial', '', 11)
-        
-        successful = [r for r in results if not r.get('error', False)]
-        pdf.cell(0, 6, f"Total Articles Analyzed: {len(results)}", 0, 1, 'L')
-        pdf.cell(0, 6, f"Successfully Analyzed: {len(successful)}", 0, 1, 'L')
-        
-        if successful:
-            pos_count = sum(1 for r in successful if r['sentiment']['label'] == 'positive')
-            aligned_count = sum(1 for r in successful if r['alignment']['status'] == 'YES')
-            pdf.cell(0, 6, f"Positive Sentiment: {pos_count}", 0, 1, 'L')
-            pdf.cell(0, 6, f"Strong Alignment: {aligned_count}", 0, 1, 'L')
-        
-        pdf.ln(10)
-        
-        # Add individual analyses
-        for result in results:
-            if not result.get('error', False):
-                pdf.add_analysis_section(result)
-                pdf.add_page()
-        
-        # Remove last empty page if needed
-        if pdf.page_no() > 1 and pdf.get_y() < 50:
-            pass
-        
-        # Save and download
-        pdf_output = BytesIO()
-        pdf_output.write(pdf.output(dest='S').encode('latin1'))
-        pdf_output.seek(0)
-        
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        
-        st.download_button(
-            label="📥 Click to Download PDF Report",
-            data=pdf_output,
-            file_name=f"sentiment_analysis_report_{timestamp}.pdf",
-            mime="application/pdf",
-            use_container_width=True
-        )
-        
-        st.success("✅ PDF report generated successfully!")
-        
-    except Exception as e:
-        st.error(f"Error generating PDF: {str(e)}")
-        st.info("Note: PDF generation requires additional setup. You can still export results as CSV.")
 
 if __name__ == "__main__":
     main()
