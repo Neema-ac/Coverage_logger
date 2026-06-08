@@ -1,3 +1,10 @@
+import subprocess
+import sys
+
+# Debug: Show installed packages
+st.text("Installed packages:")
+result = subprocess.run([sys.executable, "-m", "pip", "list"], capture_output=True, text=True)
+st.text(result.stdout[:500])
 import streamlit as st
 import requests
 from bs4 import BeautifulSoup
