@@ -6,13 +6,16 @@
 # Run:
 #   streamlit run company_sentiment_analyzer.py
 #
-# Key changes vs. the original:
-#   1. Extraction now uses trafilatura (clean article body, not page boilerplate).
-#   2. Sentiment model swapped to ProsusAI/finbert (3-class: positive/negative/neutral).
-#   3. Classification runs on token-truncated CLEAN text, averaged across chunks.
-#   4. Pillar/outcome matching uses word-boundary regex on the clean text.
-#   5. The misleading post-hoc keyword "explanation" was removed; the explanation
-#      now reflects the model's actual class distribution.
+# Fixes applied (v2):
+#   1. Confidence threshold — results below 65% flagged as "Needs Review" in UI, CSV, and HTML.
+#   2. Expanded keyword lists — Energy Access, Climate Finance, Frontier Investment pillars
+#      now cover C&I solar, energy infrastructure, sub-Saharan, battery storage, etc.
+#   3. CB mention gate — Business Outcomes only tagged when CrossBoundary is mentioned
+#      in the article; sector/industry articles no longer pick up false-positive outcomes.
+#   4. Corrupted content detection — binary/garbled extraction (>25% non-ASCII) voids the
+#      result instead of silently producing a meaningless sentiment score.
+#   5. Paywall distinction — FT, WSJ, Bloomberg etc. flagged as "Paywall — manual entry
+#      required" rather than a generic fetch failure.
 
 import streamlit as st
 import requests
@@ -58,6 +61,14 @@ st.markdown("""
     margin: 0.5rem 0;
     font-size: 0.9rem;
 }
+.review-box {
+    background-color: #fff8e1;
+    padding: 1rem;
+    border-radius: 5px;
+    border-left: 4px solid #f39c12;
+    margin: 0.5rem 0;
+    font-size: 0.9rem;
+}
 .keyword-highlight {
     background-color: #fff3cd;
     padding: 0.2rem 0.3rem;
@@ -72,38 +83,69 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
+# ------------------------------------------------------------------ #
+# Known paywall domains — Fix 5
+# ------------------------------------------------------------------ #
+PAYWALL_DOMAINS = [
+    'ft.com', 'wsj.com', 'bloomberg.com', 'economist.com',
+    'nytimes.com', 'washingtonpost.com', 'thetimes.co.uk'
+]
+
+# CrossBoundary name variants — Fix 3
+CB_NAMES = [
+    "crossboundary", "cross boundary", "cb energy",
+    "cb advisory", "cb access", "crossboundary energy",
+    "crossboundary advisory", "crossboundary group"
+]
+
 
 @st.cache_resource
 def load_sentiment_model():
     """Load FinBERT once and cache across reruns."""
     with st.spinner("Loading FinBERT model (first time takes ~30 seconds)..."):
-        # ProsusAI/finbert returns lowercase labels: positive / negative / neutral
         return pipeline("sentiment-analysis", model="ProsusAI/finbert")
 
 
 class EnhancedCompanyAnalyzer:
-    """Analyzer with explainability features."""
+    """Analyzer with explainability features and accuracy fixes."""
 
     def __init__(self):
         self.model = load_sentiment_model()
 
-        # Core positioning pillars with weighted keywords
+        # ------------------------------------------------------------------ #
+        # Fix 2 — Expanded positioning pillar keyword lists
+        # ------------------------------------------------------------------ #
         self.positioning_pillars = {
             "frontier_investment": {
-                "keywords": ["frontier market", "emerging market", "high growth", "early stage",
-                             "venture", "private equity", "innovative finance", "risk capital"],
+                "keywords": [
+                    "frontier market", "emerging market", "high growth", "early stage",
+                    "venture", "private equity", "innovative finance", "risk capital",
+                    "sub-saharan", "africa investment", "development finance", "dfi",
+                    "blended finance", "impact investing", "frontier investment"
+                ],
                 "weight": 1.0,
                 "description": "Content discusses investment in frontier/emerging markets"
             },
             "climate_finances": {
-                "keywords": ["climate finance", "green bond", "carbon credit", "renewable energy",
-                             "decarbonization", "decarbonisation", "net zero", "esg investing"],
+                "keywords": [
+                    "climate finance", "green bond", "carbon credit", "renewable energy",
+                    "decarbonization", "decarbonisation", "net zero", "esg investing",
+                    "clean energy", "energy transition", "green finance", "climate investment",
+                    "solar power", "wind power", "battery storage", "solar and battery",
+                    "clean power", "low carbon"
+                ],
                 "weight": 1.0,
                 "description": "Content focuses on climate finance and green investment"
             },
             "energy_access": {
-                "keywords": ["energy access", "off-grid", "mini-grid", "clean cooking",
-                             "electricity access", "solar home system", "last mile energy"],
+                "keywords": [
+                    "energy access", "off-grid", "mini-grid", "clean cooking",
+                    "electricity access", "solar home system", "last mile energy",
+                    "c&i solar", "commercial and industrial", "energy infrastructure",
+                    "power demand", "grid stability", "diesel dependency",
+                    "renewable power", "electricity supply", "power generation",
+                    "energy solution", "power project", "energy platform"
+                ],
                 "weight": 1.0,
                 "description": "Content addresses energy access and distribution"
             }
@@ -163,12 +205,16 @@ class EnhancedCompanyAnalyzer:
 
     def fetch_page_content(self, url):
         """Fetch a page and extract the clean ARTICLE BODY using trafilatura,
-        falling back to a cleaned BeautifulSoup parse if needed."""
+        falling back to a cleaned BeautifulSoup parse if needed.
+        Includes Fix 4 (corrupted content) and Fix 5 (paywall detection)."""
         try:
             if not url.startswith(('http://', 'https://')):
                 url = 'https://' + url
 
-            # 1) Get raw HTML (trafilatura's downloader, then requests as backup)
+            # Fix 5 — Detect known paywall domains before attempting fetch
+            is_paywall = any(domain in url for domain in PAYWALL_DOMAINS)
+
+            # 1) Get raw HTML
             html = None
             try:
                 html = trafilatura.fetch_url(url)
@@ -184,8 +230,9 @@ class EnhancedCompanyAnalyzer:
 
             title = "Untitled Article"
             text = ""
+            corrupted = False
 
-            # 2) Primary: trafilatura clean extraction (article body only)
+            # 2) Primary: trafilatura clean extraction
             extracted = trafilatura.extract(
                 html,
                 include_comments=False,
@@ -198,7 +245,7 @@ class EnhancedCompanyAnalyzer:
                 text = (data.get('text') or "").strip()
                 title = (data.get('title') or "").strip() or title
 
-            # 3) Fallback: cleaned BeautifulSoup if trafilatura found little/nothing
+            # 3) Fallback: BeautifulSoup if trafilatura found little/nothing
             if len(text) < 50:
                 soup = BeautifulSoup(html, 'html.parser')
                 if title == "Untitled Article":
@@ -209,9 +256,17 @@ class EnhancedCompanyAnalyzer:
                 text = soup.get_text(separator=' ', strip=True)
 
             text = re.sub(r'\s+', ' ', text).strip()
+
+            # Fix 4 — Detect corrupted/binary content (e.g. garbled PDF extraction)
+            if len(text) > 0:
+                non_ascii_ratio = sum(1 for c in text if ord(c) > 127) / len(text)
+                if non_ascii_ratio > 0.25:
+                    corrupted = True
+                    text = ""  # Void the result — don't analyze garbage
+                    title = f"Error: Corrupted content extracted from {url}"
+
             title = re.sub(r'\s+', ' ', title)[:100] or "Untitled Article"
 
-            # Key sentences pulled from the CLEAN text (real article content)
             sentences = re.split(r'(?<=[.!?])\s+', text)
             key_sentences = [s.strip() for s in sentences if len(s.strip()) > 60][:10]
 
@@ -219,16 +274,21 @@ class EnhancedCompanyAnalyzer:
                 'text': text[:8000],
                 'title': title,
                 'key_sentences': key_sentences,
-                'url': url
+                'url': url,
+                'corrupted': corrupted,
+                'is_paywall': is_paywall
             }
 
         except Exception as e:
+            is_paywall = any(domain in url for domain in PAYWALL_DOMAINS)
             return {
                 'text': '',
                 'title': f"Error: Could not fetch {url}",
                 'key_sentences': [],
                 'url': url,
-                'error': str(e)
+                'error': str(e),
+                'corrupted': False,
+                'is_paywall': is_paywall
             }
 
     # ------------------------------------------------------------------ #
@@ -236,8 +296,7 @@ class EnhancedCompanyAnalyzer:
     # ------------------------------------------------------------------ #
     @staticmethod
     def _chunk_text(text, max_chars=1500, max_chunks=6):
-        """Split clean text into sentence-aligned chunks (~<512 tokens each)
-        so long articles are read in full, not truncated to the lede."""
+        """Split clean text into sentence-aligned chunks (~<512 tokens each)."""
         sentences = re.split(r'(?<=[.!?])\s+', text)
         chunks, cur = [], ""
         for s in sentences:
@@ -252,8 +311,7 @@ class EnhancedCompanyAnalyzer:
 
     @staticmethod
     def _match_keywords(text_lower, keywords):
-        """Word-boundary regex match so 'top' / 'deal' / 'investment' don't
-        match inside other words or unrelated boilerplate."""
+        """Word-boundary regex match."""
         found = []
         for kw in keywords:
             if re.search(r'\b' + re.escape(kw) + r'\b', text_lower):
@@ -261,14 +319,16 @@ class EnhancedCompanyAnalyzer:
         return found
 
     # ------------------------------------------------------------------ #
-    # Sentiment
+    # Sentiment — Fix 1 (confidence threshold)
     # ------------------------------------------------------------------ #
     def analyze_sentiment_with_explanation(self, text):
-        """3-class sentiment via FinBERT, averaged over chunks of the clean body."""
+        """3-class sentiment via FinBERT, averaged over chunks.
+        Fix 1: results with confidence < 65% flagged as needs_review."""
         if not text or len(text.strip()) < 50:
             return {
                 'label': 'neutral',
                 'score': 0.5,
+                'needs_review': True,
                 'explanation': 'Insufficient content to analyze sentiment.',
                 'key_phrases': []
             }
@@ -278,7 +338,6 @@ class EnhancedCompanyAnalyzer:
 
         for ch in chunks:
             out = self.model(ch, truncation=True, max_length=512, top_k=None)
-            # Normalize shape: single-string input may return [[{...}]] or [{...}]
             scores = out[0] if out and isinstance(out[0], list) else out
             for s in scores:
                 lab = s['label'].lower()
@@ -292,6 +351,14 @@ class EnhancedCompanyAnalyzer:
         sentiment = max(agg, key=agg.get)
         confidence = agg[sentiment]
 
+        # Fix 1 — Flag low-confidence results
+        needs_review = confidence < 0.65
+
+        review_note = (
+            " ⚠️ LOW CONFIDENCE — recommend manual review before logging."
+            if needs_review else ""
+        )
+
         explanation = (
             f"FinBERT classified this as {sentiment.upper()} "
             f"(confidence {confidence:.1%}). Class distribution — "
@@ -299,18 +366,20 @@ class EnhancedCompanyAnalyzer:
             f"neutral {agg['neutral']:.0%}, "
             f"negative {agg['negative']:.0%}. "
             f"Read over {n} text chunk(s) of the extracted article body."
+            f"{review_note}"
         )
 
         return {
             'label': sentiment,
             'score': confidence,
+            'needs_review': needs_review,
             'explanation': explanation,
             'distribution': agg,
             'key_phrases': []
         }
 
     # ------------------------------------------------------------------ #
-    # Positioning
+    # Positioning — Fix 2 (expanded keywords, already in __init__)
     # ------------------------------------------------------------------ #
     def check_alignment_with_explanation(self, text):
         """Check positioning alignment with detailed explanation."""
@@ -341,16 +410,16 @@ class EnhancedCompanyAnalyzer:
 
         if len(matches) >= 2:
             status = 'YES'
-            explanation = (f"\u2705 STRONG ALIGNMENT detected! Matched {len(matches)} "
+            explanation = (f"✅ STRONG ALIGNMENT detected! Matched {len(matches)} "
                            f"core positioning pillars:\n" + "\n".join(explanation_parts))
         elif len(matches) == 1:
             status = 'PARTIAL'
-            explanation = ("\U0001F7E1 PARTIAL ALIGNMENT detected. Matched 1 core "
+            explanation = ("🟡 PARTIAL ALIGNMENT detected. Matched 1 core "
                            "positioning pillar:\n" + "\n".join(explanation_parts))
         else:
             status = 'NO'
-            explanation = ("\u274C NO ALIGNMENT detected. The content doesn't mention "
-                           "frontier investment, climate finances, or energy access.")
+            explanation = ("❌ NO ALIGNMENT detected. The content doesn't match "
+                           "frontier investment, climate finances, or energy access keywords.")
 
         return {
             'status': status,
@@ -360,13 +429,27 @@ class EnhancedCompanyAnalyzer:
         }
 
     # ------------------------------------------------------------------ #
-    # Business outcomes
+    # Business outcomes — Fix 3 (CB mention gate)
     # ------------------------------------------------------------------ #
     def determine_outcomes_with_explanation(self, text, sentiment, matched_pillars):
-        """Determine business outcomes with explanation."""
+        """Determine business outcomes.
+        Fix 3: only tag outcomes when CrossBoundary is mentioned in the article."""
         text_lower = text.lower()
-        outcomes = []
 
+        # Fix 3 — CB mention gate
+        cb_mentioned = any(name in text_lower for name in CB_NAMES)
+
+        if not cb_mentioned:
+            return {
+                'outcomes': [],
+                'cb_mentioned': False,
+                'explanation': (
+                    "CrossBoundary not mentioned in this article — "
+                    "business outcomes not tagged for sector/industry coverage."
+                )
+            }
+
+        outcomes = []
         for outcome, config in self.business_outcomes.items():
             matched_keywords = self._match_keywords(text_lower, config['keywords'])
             if matched_keywords:
@@ -399,10 +482,11 @@ class EnhancedCompanyAnalyzer:
                     explanation += (f"\n• {outcome['outcome']}: Found keywords "
                                     f"'{', '.join(outcome['keywords'][:3])}'")
         else:
-            explanation = "No specific business outcomes identified from the content."
+            explanation = "CrossBoundary mentioned but no specific outcomes matched."
 
         return {
             'outcomes': top_outcomes,
+            'cb_mentioned': True,
             'explanation': explanation
         }
 
@@ -410,19 +494,47 @@ class EnhancedCompanyAnalyzer:
     # Orchestration
     # ------------------------------------------------------------------ #
     def analyze_url(self, url):
-        """Complete analysis with explanations."""
+        """Complete analysis pipeline with all fixes applied."""
         page_data = self.fetch_page_content(url)
 
-        if not page_data['text']:
+        # Fix 5 — Distinguish paywall from generic failure
+        if page_data.get('is_paywall') and not page_data['text']:
             return {
                 'url': url,
                 'title': page_data['title'],
-                'status': 'Failed',
+                'status': 'Paywall',
                 'error': True,
+                'paywall': True,
+                'corrupted': False,
                 'sentiment': {'label': 'neutral', 'score': 0.0,
-                              'explanation': 'Could not fetch content'},
-                'alignment': {'status': 'NO', 'explanation': 'Content fetch failed', 'matches': []},
-                'outcomes': {'outcomes': [], 'explanation': 'Analysis failed'},
+                              'needs_review': True,
+                              'explanation': 'Paywalled article — manual entry required'},
+                'alignment': {'status': 'NO', 'explanation': 'Paywalled — content unavailable',
+                              'matches': []},
+                'outcomes': {'outcomes': [], 'cb_mentioned': False,
+                             'explanation': 'Paywalled — manual entry required'},
+                'key_sentences': []
+            }
+
+        # Fix 4 — Corrupted content
+        if page_data.get('corrupted') or not page_data['text']:
+            status = 'Corrupted' if page_data.get('corrupted') else 'Failed'
+            explanation = (
+                'Corrupted binary content detected — result voided. Re-run or log manually.'
+                if page_data.get('corrupted')
+                else 'Could not fetch content.'
+            )
+            return {
+                'url': url,
+                'title': page_data['title'],
+                'status': status,
+                'error': True,
+                'paywall': False,
+                'corrupted': page_data.get('corrupted', False),
+                'sentiment': {'label': 'neutral', 'score': 0.0,
+                              'needs_review': True, 'explanation': explanation},
+                'alignment': {'status': 'NO', 'explanation': explanation, 'matches': []},
+                'outcomes': {'outcomes': [], 'cb_mentioned': False, 'explanation': explanation},
                 'key_sentences': []
             }
 
@@ -439,6 +551,8 @@ class EnhancedCompanyAnalyzer:
             'title': page_data['title'],
             'status': 'Success',
             'error': False,
+            'paywall': False,
+            'corrupted': False,
             'sentiment': sentiment,
             'alignment': alignment,
             'outcomes': outcomes,
@@ -447,8 +561,11 @@ class EnhancedCompanyAnalyzer:
         }
 
 
+# ------------------------------------------------------------------ #
+# HTML Report
+# ------------------------------------------------------------------ #
 def create_html_report(results):
-    """Create HTML report for PDF conversion."""
+    """Create HTML report with all fix indicators surfaced."""
     html_content = f"""
     <!DOCTYPE html>
     <html>
@@ -469,21 +586,36 @@ def create_html_report(results):
             .alignment-partial {{ color: #f39c12; font-weight: bold; }}
             .alignment-no {{ color: #e74c3c; font-weight: bold; }}
             .explanation {{ background: #f8f9fa; padding: 15px; border-left: 4px solid #667eea; margin: 10px 0; }}
+            .needs-review {{ background: #fff8e1; padding: 15px; border-left: 4px solid #f39c12; margin: 10px 0; }}
+            .error-paywall {{ background: #fff3f3; padding: 15px; border-left: 4px solid #e74c3c; margin: 10px 0; }}
             .keyword {{ background: #fff3cd; padding: 2px 5px; border-radius: 3px; font-family: monospace; }}
             .footer {{ text-align: center; margin-top: 50px; padding-top: 20px; border-top: 1px solid #ddd; font-size: 12px; color: #666; }}
+            .badge-review {{ background: #f39c12; color: white; padding: 2px 8px; border-radius: 10px; font-size: 11px; margin-left: 8px; }}
+            .badge-paywall {{ background: #e74c3c; color: white; padding: 2px 8px; border-radius: 10px; font-size: 11px; margin-left: 8px; }}
+            .badge-cb {{ background: #27ae60; color: white; padding: 2px 8px; border-radius: 10px; font-size: 11px; margin-left: 8px; }}
         </style>
     </head>
     <body>
-        <h1>\U0001F3E2 Company Image Sentiment Analysis Report</h1>
+        <h1>🏢 Company Image Sentiment Analysis Report</h1>
         <p><strong>Generated:</strong> {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}</p>
+        <p><em>v2 — includes confidence flagging, expanded keywords, CB mention gate, corrupted-content voiding, and paywall detection.</em></p>
 
         <div class="summary">
             <h2>Executive Summary</h2>
     """
 
     successful = [r for r in results if not r.get('error', False)]
-    html_content += f"<p><strong>Total Articles Analyzed:</strong> {len(results)}</p>"
+    needs_review = [r for r in successful if r['sentiment'].get('needs_review', False)]
+    paywalled = [r for r in results if r.get('paywall', False)]
+    corrupted = [r for r in results if r.get('corrupted', False)]
+    cb_articles = [r for r in successful if r['outcomes'].get('cb_mentioned', False)]
+
+    html_content += f"<p><strong>Total Articles:</strong> {len(results)}</p>"
     html_content += f"<p><strong>Successfully Analyzed:</strong> {len(successful)}</p>"
+    html_content += f"<p><strong>⚠️ Needs Manual Review (low confidence):</strong> {len(needs_review)}</p>"
+    html_content += f"<p><strong>🔒 Paywalled (manual entry required):</strong> {len(paywalled)}</p>"
+    html_content += f"<p><strong>💥 Corrupted / Failed:</strong> {len(corrupted) + len([r for r in results if r.get('status') == 'Failed'])}</p>"
+    html_content += f"<p><strong>CB-Mentioned Articles:</strong> {len(cb_articles)}</p>"
 
     if successful:
         pos_count = sum(1 for r in successful if r['sentiment']['label'] == 'positive')
@@ -499,57 +631,85 @@ def create_html_report(results):
     html_content += "</div>"
 
     for idx, result in enumerate(results, 1):
+        # Fix 5 — Paywall
+        if result.get('paywall'):
+            html_content += f"""
+            <div class="article">
+                <h3>{idx}. {result['title']} <span class="badge-paywall">PAYWALL</span></h3>
+                <p><strong>URL:</strong> {result['url']}</p>
+                <div class="error-paywall">
+                    <p>🔒 <strong>Paywalled article — manual entry required.</strong></p>
+                    <p>Log sentiment and alignment manually after reading the article directly.</p>
+                </div>
+            </div>
+            """
+            continue
+
+        # Fix 4 — Corrupted or failed
         if result.get('error', False):
+            status_label = "CORRUPTED" if result.get('corrupted') else "FAILED"
             html_content += f"""
             <div class="article">
                 <h3>{idx}. {result['title']}</h3>
                 <p><strong>URL:</strong> {result['url']}</p>
-                <p><strong>Status:</strong> \u274C Failed to analyze</p>
-                <p>Could not fetch or parse content.</p>
+                <div class="error-paywall">
+                    <p>❌ <strong>Status: {status_label}</strong></p>
+                    <p>{result['sentiment']['explanation']}</p>
+                </div>
             </div>
             """
-        else:
-            sentiment_class = f"sentiment-{result['sentiment']['label']}"
-            alignment_class = f"alignment-{result['alignment']['status'].lower()}"
+            continue
 
-            html_content += f"""
-            <div class="article">
-                <h3>{idx}. {result['title']}</h3>
-                <p><strong>URL:</strong> <a href="{result['url']}">{result['url']}</a></p>
+        sentiment_class = f"sentiment-{result['sentiment']['label']}"
+        alignment_class = f"alignment-{result['alignment']['status'].lower()}"
+        needs_review_flag = result['sentiment'].get('needs_review', False)
+        cb_flag = result['outcomes'].get('cb_mentioned', False)
 
-                <h4>\U0001F3AD Sentiment Analysis</h4>
-                <div class="explanation">
-                    <p><strong>Result:</strong> <span class="{sentiment_class}">{result['sentiment']['label'].upper()}</span> (Confidence: {result['sentiment']['score']:.1%})</p>
-                    <p><strong>Explanation:</strong> {result['sentiment']['explanation']}</p>
-                </div>
+        review_badge = '<span class="badge-review">⚠️ NEEDS REVIEW</span>' if needs_review_flag else ''
+        cb_badge = '<span class="badge-cb">CB MENTIONED</span>' if cb_flag else ''
 
-                <h4>\U0001F3AF Positioning Alignment</h4>
-                <div class="explanation">
-                    <p><strong>Status:</strong> <span class="{alignment_class}">{result['alignment']['status']}</span></p>
-                    <p><strong>Explanation:</strong> {result['alignment']['explanation']}</p>
-                </div>
+        html_content += f"""
+        <div class="article">
+            <h3>{idx}. {result['title']} {review_badge} {cb_badge}</h3>
+            <p><strong>URL:</strong> <a href="{result['url']}">{result['url']}</a></p>
 
-                <h4>\U0001F4BC Business Outcomes</h4>
-                <div class="explanation">
-                    <p><strong>Identified:</strong> {', '.join([o['outcome'] for o in result['outcomes']['outcomes']]) if result['outcomes']['outcomes'] else 'None'}</p>
-                    <p><strong>Explanation:</strong> {result['outcomes']['explanation']}</p>
-                </div>
+            <h4>🎭 Sentiment Analysis</h4>
+            <div class="{'needs-review' if needs_review_flag else 'explanation'}">
+                <p><strong>Result:</strong> <span class="{sentiment_class}">{result['sentiment']['label'].upper()}</span>
+                (Confidence: {result['sentiment']['score']:.1%})
+                {'<strong> ⚠️ Low confidence — manual review recommended before logging.</strong>' if needs_review_flag else ''}</p>
+                <p><strong>Explanation:</strong> {result['sentiment']['explanation']}</p>
+            </div>
+
+            <h4>🎯 Positioning Alignment</h4>
+            <div class="explanation">
+                <p><strong>Status:</strong> <span class="{alignment_class}">{result['alignment']['status']}</span></p>
+                <p><strong>Explanation:</strong> {result['alignment']['explanation']}</p>
+            </div>
+
+            <h4>💼 Business Outcomes</h4>
+            <div class="explanation">
+                <p><strong>CB Mentioned:</strong> {'✅ Yes' if cb_flag else '❌ No — outcomes not tagged'}</p>
+                <p><strong>Identified:</strong> {', '.join([o['outcome'] for o in result['outcomes']['outcomes']]) if result['outcomes']['outcomes'] else 'None'}</p>
+                <p><strong>Explanation:</strong> {result['outcomes']['explanation']}</p>
+            </div>
+        """
+
+        if result.get('key_sentences'):
+            html_content += """
+            <h4>📝 Key Excerpts</h4>
+            <ul>
             """
+            for sentence in result['key_sentences'][:3]:
+                html_content += f"<li>\"{sentence[:200]}...\"</li>"
+            html_content += "</ul>"
 
-            if result.get('key_sentences'):
-                html_content += """
-                <h4>\U0001F4DD Key Excerpts</h4>
-                <ul>
-                """
-                for sentence in result['key_sentences'][:3]:
-                    html_content += f"<li>\"{sentence[:200]}...\"</li>"
-                html_content += "</ul>"
-
-            html_content += "</div>"
+        html_content += "</div>"
 
     html_content += """
         <div class="footer">
-            <p>Report generated by Company Image Sentiment Analyzer</p>
+            <p>Report generated by Company Image Sentiment Analyzer v2</p>
+            <p>Fixes: confidence threshold · expanded keywords · CB mention gate · corrupted content voiding · paywall detection</p>
         </div>
     </body>
     </html>
@@ -558,10 +718,13 @@ def create_html_report(results):
     return html_content
 
 
+# ------------------------------------------------------------------ #
+# Streamlit UI
+# ------------------------------------------------------------------ #
 def main():
     st.markdown("""
     <div class="big-title">
-        <h1>\U0001F3E2 Company Image Sentiment Analyzer</h1>
+        <h1>🏢 Company Image Sentiment Analyzer</h1>
         <p>FinBERT-powered analysis with clean article extraction</p>
     </div>
     """, unsafe_allow_html=True)
@@ -570,27 +733,29 @@ def main():
         st.session_state.analyzer = EnhancedCompanyAnalyzer()
 
     with st.sidebar:
-        st.markdown("### \u2699\uFE0F Settings")
-        max_workers = st.slider("Parallel workers", 1, 3, 2)
-        st.caption("Parallelism speeds up fetching; model inference is serialized by the GIL.")
+        st.markdown("### ⚙️ Settings")
+        max_workers = st.slider("Parallel workers", 1, 3, 1)
+        st.caption("Keep at 1 on Streamlit Community Cloud (1 GB RAM) to avoid out-of-memory crashes.")
+
         st.markdown("---")
-        st.markdown("### \U0001F4CA Features")
+        st.markdown("### 📊 Accuracy Notes")
         st.info("""
-        \u2705 **FinBERT 3-class sentiment** (positive / neutral / negative)
-        \u2705 **Clean extraction** via trafilatura (article body only)
-        \u2705 **Positioning alignment** with word-boundary keyword matching
-        \u2705 **Business outcomes** identification
-        \u2705 **CSV / JSON / HTML** exports
-        """)
-        st.markdown("---")
-        st.markdown("### \U0001F4A1 Tips")
-        st.info("""
-        - Expand any result to see detailed explanations
-        - Paywalled / JS-heavy sites may still fail to fetch — paste text if needed
-        - Download CSV for data, HTML for a client-ready report
+        **Confidence threshold:** Results below 65% are flagged ⚠️ for manual review — don't log these automatically.
+
+        **CB mention gate:** Business Outcomes are only tagged when CrossBoundary appears in the article. Sector news won't produce false-positive outcomes.
+
+        **Paywalled sites** (FT, WSJ, Bloomberg) are flagged for manual entry — the tool won't attempt to guess their content.
         """)
 
-    st.markdown("### \U0001F4DD Enter URLs to Analyze")
+        st.markdown("---")
+        st.markdown("### 💡 Tips")
+        st.info("""
+        - Expand any result to see detailed explanations
+        - Download CSV for bulk review — filter 'Needs Review = TRUE' first
+        - Download HTML for a client-ready report
+        """)
+
+    st.markdown("### 📝 Enter URLs to Analyze")
 
     col1, col2 = st.columns([3, 1])
     with col1:
@@ -611,9 +776,9 @@ def main():
             "https://www.ifc.org"
         ]
         urls = example_urls
-        st.success(f"\U0001F4CB Loaded {len(urls)} example URLs")
+        st.success(f"📋 Loaded {len(urls)} example URLs")
 
-    analyze_btn = st.button("\U0001F50D Analyze URLs", type="primary", use_container_width=True)
+    analyze_btn = st.button("🔍 Analyze URLs", type="primary", use_container_width=True)
 
     if analyze_btn and urls:
         progress_bar = st.progress(0)
@@ -631,12 +796,12 @@ def main():
         st.session_state.results = results
 
         successful = [r for r in results if not r.get('error', False)]
-        st.success(f"\u2705 Analysis complete! {len(successful)}/{len(results)} URLs successfully analyzed")
+        st.success(f"✅ Analysis complete! {len(successful)}/{len(results)} URLs successfully analyzed")
 
         display_detailed_results(results)
 
         st.markdown("---")
-        st.markdown("### \U0001F4C4 Export Results")
+        st.markdown("### 📄 Export Results")
 
         col1, col2, col3 = st.columns(3)
 
@@ -646,15 +811,21 @@ def main():
                 'Title': r['title'],
                 'Status': r['status'],
                 'Sentiment': r['sentiment']['label'].upper() if not r.get('error') else 'ERROR',
-                'Confidence': r['sentiment']['score'] if not r.get('error') else 0,
+                'Confidence': f"{r['sentiment']['score']:.1%}" if not r.get('error') else 'N/A',
+                # Fix 1 — Needs Review column in CSV
+                'Needs Review': r['sentiment'].get('needs_review', True) if not r.get('error') else True,
                 'Alignment': r['alignment']['status'] if not r.get('error') else 'N/A',
+                # Fix 3 — CB Mentioned column in CSV
+                'CB Mentioned': r['outcomes'].get('cb_mentioned', False) if not r.get('error') else False,
                 'Outcomes': ', '.join([o['outcome'] for o in r['outcomes']['outcomes']]) if not r.get('error') and r['outcomes']['outcomes'] else '',
+                # Fix 5 — Paywall flag in CSV
+                'Paywall': r.get('paywall', False),
                 'Explanation': r['sentiment']['explanation'] if not r.get('error') else ''
             } for r in results])
 
             csv = df.to_csv(index=False)
             st.download_button(
-                label="\U0001F4E5 Download CSV",
+                label="📥 Download CSV",
                 data=csv,
                 file_name=f"sentiment_analysis_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
                 mime="text/csv",
@@ -664,7 +835,7 @@ def main():
         with col2:
             json_data = json.dumps(results, default=str, indent=2)
             st.download_button(
-                label="\U0001F4E5 Download JSON",
+                label="📥 Download JSON",
                 data=json_data,
                 file_name=f"sentiment_analysis_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
                 mime="application/json",
@@ -674,77 +845,125 @@ def main():
         with col3:
             html_report = create_html_report(results)
             st.download_button(
-                label="\U0001F4E5 Download HTML Report",
+                label="📥 Download HTML Report",
                 data=html_report,
                 file_name=f"sentiment_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.html",
                 mime="text/html",
                 use_container_width=True
             )
-            st.caption("\U0001F4A1 Open the HTML in any browser, then Print \u2192 Save as PDF")
+            st.caption("💡 Open the HTML in any browser, then Print → Save as PDF")
 
     elif analyze_btn and not urls:
-        st.warning("\u26A0\uFE0F Please enter at least one URL to analyze")
+        st.warning("⚠️ Please enter at least one URL to analyze")
 
     elif 'results' in st.session_state and st.session_state.results:
-        if st.button("\U0001F4CA Show Previous Results"):
+        if st.button("📊 Show Previous Results"):
             display_detailed_results(st.session_state.results)
 
 
 def display_detailed_results(results):
-    """Display results with expandable explanations."""
+    """Display results with expandable explanations and fix indicators."""
     successful = [r for r in results if not r.get('error', False)]
 
-    col1, col2, col3, col4 = st.columns(4)
+    col1, col2, col3, col4, col5 = st.columns(5)
     with col1:
-        st.metric("\u2705 Successfully Analyzed", len(successful))
+        st.metric("✅ Analyzed", len(successful))
     with col2:
         pos_count = sum(1 for r in successful if r['sentiment']['label'] == 'positive')
-        st.metric("\U0001F60A Positive Sentiment", pos_count)
+        st.metric("😊 Positive", pos_count)
     with col3:
         aligned = sum(1 for r in successful if r['alignment']['status'] == 'YES')
-        st.metric("\U0001F3AF Strong Alignment", aligned)
+        st.metric("🎯 Strong Alignment", aligned)
     with col4:
+        # Fix 1 — Surface review count in metrics
+        review_count = sum(1 for r in successful if r['sentiment'].get('needs_review', False))
+        st.metric("⚠️ Needs Review", review_count)
+    with col5:
         avg_confidence = sum(r['sentiment']['score'] for r in successful) / len(successful) if successful else 0
-        st.metric("\U0001F4CA Avg Confidence", f"{avg_confidence:.1%}")
+        st.metric("📊 Avg Confidence", f"{avg_confidence:.1%}")
 
     st.markdown("---")
-    st.markdown("### \U0001F4CB Detailed Analysis Results")
+
+    # Fix 1 — Review queue at top
+    review_articles = [r for r in successful if r['sentiment'].get('needs_review', False)]
+    if review_articles:
+        with st.expander(f"⚠️ Manual Review Queue ({len(review_articles)} articles need checking)", expanded=True):
+            st.markdown("These articles have sentiment confidence below 65% and should be reviewed before logging to the coverage tracker.")
+            for r in review_articles:
+                st.markdown(
+                    f"- **{r['title'][:70]}** — {r['sentiment']['label'].upper()} "
+                    f"({r['sentiment']['score']:.1%} confidence) — [link]({r['url']})"
+                )
+
+    # Fix 5 — Paywall queue
+    paywall_articles = [r for r in results if r.get('paywall', False)]
+    if paywall_articles:
+        with st.expander(f"🔒 Paywalled Articles ({len(paywall_articles)} — manual entry required)", expanded=False):
+            st.markdown("These articles could not be fetched. Log sentiment and alignment manually after reading directly.")
+            for r in paywall_articles:
+                st.markdown(f"- {r['url']}")
+
+    st.markdown("### 📋 Detailed Analysis Results")
     st.markdown("*Click on any section below to see detailed explanations*")
 
     for idx, result in enumerate(results, 1):
-        status_icon = "\u2705" if not result.get('error') else "\u274C"
-        title_display = result['title'][:80] if len(result['title']) > 80 else result['title']
+        needs_review_flag = result['sentiment'].get('needs_review', False)
+        paywall_flag = result.get('paywall', False)
+        corrupted_flag = result.get('corrupted', False)
+        cb_flag = result['outcomes'].get('cb_mentioned', False) if not result.get('error') else False
 
-        with st.expander(f"{status_icon} {idx}. {title_display}", expanded=False):
-            if result.get('error'):
-                st.error(f"\u274C Failed to analyze: {result['title']}")
+        # Build expander label with status badges
+        status_icon = "✅" if not result.get('error') else ("🔒" if paywall_flag else "❌")
+        review_tag = " ⚠️" if needs_review_flag else ""
+        cb_tag = " 🏢" if cb_flag else ""
+        title_display = result['title'][:70] if len(result['title']) > 70 else result['title']
+
+        with st.expander(f"{status_icon} {idx}. {title_display}{review_tag}{cb_tag}", expanded=False):
+
+            # Fix 5 — Paywall
+            if paywall_flag:
+                st.error("🔒 Paywalled article — manual entry required")
                 st.code(result['url'])
+                continue
+
+            # Fix 4 — Corrupted or failed
+            if result.get('error'):
+                st.error(f"❌ {result['status']}: {result['title']}")
+                st.code(result['url'])
+                if corrupted_flag:
+                    st.warning("💥 Corrupted binary content was detected and voided. Re-run or log manually.")
                 continue
 
             st.markdown(f"**URL:** {result['url']}")
 
-            st.markdown("#### \U0001F3AD Sentiment Analysis")
+            # Fix 3 — CB mention indicator
+            if cb_flag:
+                st.success("🏢 CrossBoundary mentioned — business outcomes tagged")
+            else:
+                st.info("ℹ️ CrossBoundary not mentioned — sector/industry coverage, outcomes not tagged")
+
+            st.markdown("#### 🎭 Sentiment Analysis")
             sentiment_color = {
                 'positive': 'green',
                 'negative': 'red',
                 'neutral': 'orange'
             }.get(result['sentiment']['label'], 'gray')
 
+            box_class = "review-box" if needs_review_flag else "explanation-box"
+            review_warning = "<br><strong>⚠️ Low confidence — manually verify before logging to the coverage tracker.</strong>" if needs_review_flag else ""
+
             st.markdown(f"""
-            <div class="explanation-box">
+            <div class="{box_class}">
                 <strong>Result:</strong> <span style="color: {sentiment_color}; font-weight: bold;">
                 {result['sentiment']['label'].upper()}</span>
-                (Confidence: {result['sentiment']['score']:.1%})<br>
+                (Confidence: {result['sentiment']['score']:.1%}){review_warning}<br>
                 <strong>Explanation:</strong> {result['sentiment']['explanation']}
             </div>
             """, unsafe_allow_html=True)
 
-            st.markdown("#### \U0001F3AF Positioning Alignment")
-            alignment_color = {
-                'YES': 'green',
-                'PARTIAL': 'orange',
-                'NO': 'red'
-            }.get(result['alignment']['status'], 'gray')
+            st.markdown("#### 🎯 Positioning Alignment")
+            alignment_color = {'YES': 'green', 'PARTIAL': 'orange', 'NO': 'red'}.get(
+                result['alignment']['status'], 'gray')
 
             st.markdown(f"""
             <div class="explanation-box">
@@ -759,29 +978,30 @@ def display_detailed_results(results):
                 for match in result['alignment']['matches']:
                     st.markdown(f"- {match['pillar'].replace('_', ' ').title()}: `{', '.join(match['keywords'][:3])}`")
 
-            st.markdown("#### \U0001F4BC Business Outcomes")
+            st.markdown("#### 💼 Business Outcomes")
             if result['outcomes']['outcomes']:
                 outcomes_html = "<div class='explanation-box'>"
                 outcomes_html += f"<strong>Identified Outcomes:</strong> {', '.join([o['outcome'] for o in result['outcomes']['outcomes']])}<br>"
                 outcomes_html += f"<strong>Explanation:</strong> {result['outcomes']['explanation']}<br>"
                 for outcome in result['outcomes']['outcomes']:
                     if outcome.get('keywords'):
-                        outcomes_html += f"<br><strong>{outcome['outcome']}:</strong> Found keywords: `{', '.join(outcome['keywords'][:3])}`"
+                        outcomes_html += f"<br><strong>{outcome['outcome']}:</strong> Keywords: `{', '.join(outcome['keywords'][:3])}`"
                 outcomes_html += "</div>"
                 st.markdown(outcomes_html, unsafe_allow_html=True)
             else:
                 st.markdown(f"""
                 <div class="explanation-box">
-                    <strong>No specific outcomes identified</strong><br>
                     {result['outcomes']['explanation']}
                 </div>
                 """, unsafe_allow_html=True)
 
             if result.get('key_sentences'):
-                st.markdown("#### \U0001F4DD Key Excerpts (from extracted article body)")
+                st.markdown("#### 📝 Key Excerpts (from extracted article body)")
                 for i, sentence in enumerate(result['key_sentences'][:3], 1):
-                    st.markdown(f"<div class='explanation-box'><strong>{i}.</strong> \"{sentence[:250]}...\"</div>",
-                                unsafe_allow_html=True)
+                    st.markdown(
+                        f"<div class='explanation-box'><strong>{i}.</strong> \"{sentence[:250]}...\"</div>",
+                        unsafe_allow_html=True
+                    )
 
 
 if __name__ == "__main__":
