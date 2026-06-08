@@ -8,8 +8,6 @@ import pandas as pd
 import time
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
-import plotly.graph_objects as go
-import plotly.express as px
 
 # Page configuration
 st.set_page_config(
@@ -28,25 +26,11 @@ st.markdown("""
         margin-bottom: 2rem;
         text-align: center;
     }
-    .success-box {
-        background-color: #d4edda;
-        padding: 1rem;
-        border-radius: 5px;
-        border-left: 4px solid #28a745;
-        margin: 1rem 0;
-    }
-    .metric-card {
-        background-color: white;
-        padding: 1rem;
-        border-radius: 10px;
-        box-shadow: 0 2px 4px rgba(0,0,0,0.1);
-        text-align: center;
-    }
 </style>
 """, unsafe_allow_html=True)
 
 class CompanyImageAnalyzer:
-    """Analyzes website content for sentiment, positioning, and business outcomes."""
+    """Analyzes website content for sentiment and positioning."""
     
     def __init__(self):
         @st.cache_resource
@@ -57,8 +41,6 @@ class CompanyImageAnalyzer:
                     model="distilbert-base-uncased-finetuned-sst-2-english"
                 )
         self.sentiment_analyzer = load_model()
-        
-        # ========== CUSTOMIZE THESE FOR YOUR COMPANY ==========
         
         # Core positioning pillars
         self.positioning_pillars = {
@@ -240,57 +222,41 @@ def main():
         max_workers = st.slider("Parallel workers", 1, 5, 3)
         st.markdown("---")
         st.markdown("### 🎯 Customization")
-        st.info("Edit the `positioning_pillars` and `outcome_mapping` in the code to customize for your company.")
+        st.info("Edit the positioning_pillars and outcome_mapping in the code to customize for your company.")
     
-    # Main content
-    col1, col2 = st.columns([2, 1])
+    # URL Input
+    st.markdown("### 📝 Enter URLs to Analyze")
     
-    with col1:
-        st.markdown("### 📝 Enter URLs to Analyze")
-        
-        input_method = st.radio(
-            "Choose input method:",
-            ["Paste URLs", "Use Examples"],
-            horizontal=True
+    input_method = st.radio(
+        "Choose input method:",
+        ["Paste URLs", "Use Examples"],
+        horizontal=True
+    )
+    
+    urls = []
+    
+    if input_method == "Paste URLs":
+        url_text = st.text_area(
+            "Enter one URL per line:",
+            height=200,
+            placeholder="https://example.com\nhttps://another-site.com"
         )
-        
-        urls = []
-        
-        if input_method == "Paste URLs":
-            url_text = st.text_area(
-                "Enter one URL per line:",
-                height=200,
-                placeholder="https://example.com\nhttps://another-site.com"
-            )
-            urls = [u.strip() for u in url_text.split('\n') if u.strip()]
-        else:
-            example_urls = [
-                "https://www.climatefinancelab.org",
-                "https://www.energyaccess.org",
-                "https://www.ifc.org",
-                "https://www.worldbank.org/en/topic/climatefinance"
-            ]
-            urls = example_urls
-            st.info(f"Loaded {len(urls)} example URLs")
-            for url in urls:
-                st.code(url)
-        
-        analyze_button = st.button("🚀 Analyze URLs", type="primary", use_container_width=True)
+        urls = [u.strip() for u in url_text.split('\n') if u.strip()]
+    else:
+        example_urls = [
+            "https://www.climatefinancelab.org",
+            "https://www.energyaccess.org",
+            "https://www.ifc.org"
+        ]
+        urls = example_urls
+        st.success(f"Loaded {len(urls)} example URLs")
     
-    with col2:
-        st.markdown("""
-        <div class="metric-card">
-            <h3>📊 Batch Analysis</h3>
-            <p>Parallel processing for fast results</p>
-        </div>
-        """, unsafe_allow_html=True)
+    analyze_button = st.button("🚀 Analyze URLs", type="primary", use_container_width=True)
     
     # Analysis execution
     if analyze_button and urls:
-        with st.spinner(f"Analyzing {len(urls)} URLs with {max_workers} workers..."):
+        with st.spinner(f"Analyzing {len(urls)} URLs..."):
             progress_bar = st.progress(0)
-            status_text = st.empty()
-            
             results = []
             
             with ThreadPoolExecutor(max_workers=max_workers) as executor:
@@ -300,92 +266,28 @@ def main():
                     result = future.result()
                     results.append(result)
                     progress_bar.progress((idx + 1) / len(urls))
-                    status_text.text(f"Analyzed {idx + 1}/{len(urls)} URLs")
-            
-            # Store results
-            st.session_state.results = results
             
             # Display results
-            display_results(results)
+            successful = [r for r in results if not r.get('error', False)]
+            
+            st.success(f"✅ Analysis complete! {len(successful)}/{len(results)} successful")
+            
+            # Show results table
+            df = pd.DataFrame(results)
+            display_cols = ['url', 'status', 'sentiment', 'alignment', 'pillars', 'outcomes']
+            st.dataframe(df[display_cols], use_container_width=True)
+            
+            # Export button
+            csv = df.to_csv(index=False)
+            st.download_button(
+                label="📥 Download CSV",
+                data=csv,
+                file_name=f"sentiment_analysis_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                mime="text/csv"
+            )
             
     elif analyze_button and not urls:
         st.warning("Please enter at least one URL to analyze")
-    
-    # Display previous results
-    elif 'results' in st.session_state and st.session_state.results:
-        if st.button("Show Previous Results"):
-            display_results(st.session_state.results)
-
-def display_results(results):
-    """Display analysis results."""
-    successful = [r for r in results if not r.get('error', False)]
-    failed = [r for r in results if r.get('error', False)]
-    
-    # Summary metrics
-    st.markdown("---")
-    st.markdown("## 📈 Analysis Summary")
-    
-    col1, col2, col3, col4 = st.columns(4)
-    
-    with col1:
-        st.metric("✅ Successful", len(successful))
-    with col2:
-        st.metric("❌ Failed", len(failed))
-    with col3:
-        if successful:
-            pos_count = sum(1 for r in successful if r['sentiment'] == 'POSITIVE')
-            st.metric("😊 Positive", f"{pos_count}/{len(successful)}")
-    with col4:
-        if successful:
-            aligned = sum(1 for r in successful if r['alignment'] == 'YES')
-            st.metric("🎯 Aligned", f"{aligned}/{len(successful)}")
-    
-    # Charts
-    if successful:
-        col1, col2 = st.columns(2)
-        
-        with col1:
-            sentiment_counts = pd.DataFrame([r['sentiment'] for r in successful]).value_counts()
-            fig = go.Figure(data=[go.Pie(
-                labels=sentiment_counts.index,
-                values=sentiment_counts.values,
-                marker_colors=['#27ae60', '#e74c3c', '#f39c12']
-            )])
-            fig.update_layout(title="Sentiment Distribution", height=400)
-            st.plotly_chart(fig, use_container_width=True)
-        
-        with col2:
-            alignment_counts = pd.DataFrame([r['alignment'] for r in successful]).value_counts()
-            fig = go.Figure(data=[go.Bar(
-                x=alignment_counts.index,
-                y=alignment_counts.values,
-                marker_color=['#27ae60', '#f39c12', '#e74c3c']
-            )])
-            fig.update_layout(title="Positioning Alignment", height=400)
-            st.plotly_chart(fig, use_container_width=True)
-    
-    # Detailed results table
-    st.markdown("---")
-    st.markdown("## 📋 Detailed Results")
-    
-    df_display = pd.DataFrame(results)
-    display_cols = ['url', 'status', 'sentiment', 'confidence', 'alignment', 'pillars', 'outcomes']
-    df_display = df_display[display_cols]
-    
-    st.dataframe(df_display, use_container_width=True, height=400)
-    
-    # Export options
-    st.markdown("---")
-    st.markdown("## 💾 Export Results")
-    
-    csv = df_display.to_csv(index=False)
-    st.download_button(
-        label="📥 Download CSV",
-        data=csv,
-        file_name=f"sentiment_analysis_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-        mime="text/csv",
-        use_container_width=True
-    )
 
 if __name__ == "__main__":
     main()
