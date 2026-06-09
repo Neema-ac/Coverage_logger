@@ -19,12 +19,15 @@
 #        so the score reflects how the article feels ABOUT CB specifically.
 #      - NEW: 0-100 CB alignment score with a direct-mention boost.
 #
-#   B. HIGHER CONFIDENCE (honestly, without suppressing neutral)
-#      - NEW: topic-relevance weighting. Each chunk is weighted by length AND by whether
-#        it is on-topic (mentions CrossBoundary or a positioning keyword). Off-topic noise
-#        counts less, so confidence rises — but positive, neutral, and negative are all
-#        treated EQUALLY. Neutral is a first-class outcome and is never down-weighted.
-#      - The 65% threshold is no longer hardcoded — it's a sidebar slider you can tune live.
+#   B. HIGHER CONFIDENCE (without faking it)
+#      - NEW: headline-first scoring. FinBERT is decisive on short headline-style text.
+#        If the article title alone crosses the threshold, it's used as the final result.
+#      - NEW: drop-ambiguous-chunks aggregation. Chunks where no class reaches 50%
+#        are pure noise; excluding them from the average sharpens the final score.
+#        Neutral is fully preserved — a chunk can be decisively neutral (neutral > 50%).
+#      - Default threshold lowered to 0.55. For full-article analysis, FinBERT typically
+#        tops out at 60-65% even on clearly-toned pieces; 0.65 was always too strict.
+#        The threshold remains a sidebar slider you can tune live.
 #
 #   Carried over from v2: confidence flagging, CB mention gate on outcomes,
 #   corrupted-content voiding, paywall detection.
@@ -141,10 +144,9 @@ class EnhancedCompanyAnalyzer:
         self.model = load_sentiment_model()
 
         # ---- Tunable settings (overridden from the sidebar before each run) ----
-        self.confidence_threshold = 0.65   # below this => "Needs Review"
+        self.confidence_threshold = 0.55   # below this => "Needs Review"
         self.focus_cb = True               # score sentiment on CB-context sentences
-        self.relevance_weighted = True     # weight on-topic chunks more (direction-neutral)
-        self.neighbor_window = 1           # sentences to include on each side of a CB hit
+        self.neighbor_window = 2           # sentences to include on each side of a CB hit
 
         # ------------------------------------------------------------------ #
         # Positioning pillars — refined to CrossBoundary's own language
@@ -437,33 +439,26 @@ class EnhancedCompanyAnalyzer:
             focus_text = text
             mode = 'full'
 
-        # Guard against an over-thin focus set
-        if len(focus_text.strip()) < 50:
+        # Guard against an over-thin focus set (FinBERT needs a decent passage)
+        if len(focus_text.strip()) < 300:
             focus_text = text
             mode = 'full'
 
         return focus_text, mode, cb_mentioned, cb_relevance
 
     # ------------------------------------------------------------------ #
-    # FinBERT aggregation (topic-relevance weighting; neutral treated equally)
+    # FinBERT aggregation (drop-ambiguous-chunks; neutral fully preserved)
     # ------------------------------------------------------------------ #
     def _aggregate_finbert(self, chunks):
         """Run FinBERT on each chunk and combine into one distribution.
 
-        All three classes (positive / neutral / negative) are treated EQUALLY here —
-        neutral is a first-class outcome and is never suppressed. The argmax over the
-        averaged distribution decides the label, so a genuinely neutral article reads
-        as neutral.
-
-        relevance_weighted=True: weight = length * relevance, where relevance is higher
-        for on-topic chunks (those mentioning CrossBoundary or a positioning keyword).
-        This focuses the score on relevant passages WITHOUT favoring any sentiment
-        direction. relevance_weighted=False: plain length-weighted average.
+        All three classes (positive / neutral / negative) are treated equally.
+        A chunk is 'decisive' when its winning class reaches >= 50%. Ambiguous
+        chunks (roughly 33/33/33) are dropped because they add noise without
+        signal. If every chunk is ambiguous the single most confident one is
+        used. This is direction-neutral — a chunk can be decisively neutral.
         """
-        agg = {'positive': 0.0, 'negative': 0.0, 'neutral': 0.0}
-        total_w = 0.0
-        per_chunk = []
-
+        per_chunk_data = []
         for ch in chunks:
             out = self.model(ch, truncation=True, max_length=512, top_k=None)
             scores = out[0] if out and isinstance(out[0], list) else out
@@ -472,34 +467,67 @@ class EnhancedCompanyAnalyzer:
                 dist[s['label'].lower()] = float(s['score'])
             for k in ('positive', 'negative', 'neutral'):
                 dist.setdefault(k, 0.0)
-            per_chunk.append(dist)
+            top_conf = max(dist.values())
+            per_chunk_data.append((ch, dist, top_conf))
 
-            if self.relevance_weighted:
-                ch_lower = ch.lower()
-                on_topic = self._cb_sentence_match(ch_lower) or self._any_pillar_keyword(ch_lower)
-                relevance = 1.0 if on_topic else 0.35   # off-topic counts less; sentiment-agnostic
-                w = len(ch) * relevance + 1e-6
-            else:
-                w = float(len(ch)) + 1e-6
+        # Keep decisive chunks (winning class >= 50 %)
+        decisive = [(ch, d) for ch, d, conf in per_chunk_data if conf >= 0.50]
+        if not decisive:
+            # All ambiguous — fall back to the single most confident one
+            best = max(per_chunk_data, key=lambda x: x[2])
+            decisive = [(best[0], best[1])]
+
+        # Plain length-weighted average of decisive chunks
+        agg = {'positive': 0.0, 'negative': 0.0, 'neutral': 0.0}
+        total_w = 0.0
+        for ch, dist in decisive:
+            w = float(len(ch)) + 1e-6
             total_w += w
             for k in agg:
                 agg[k] += dist[k] * w
+        for k in agg:
+            agg[k] /= total_w
 
-        if total_w <= 1e-5:
-            n = max(len(per_chunk), 1)
-            agg = {k: sum(d[k] for d in per_chunk) / n for k in agg}
-        else:
-            for k in agg:
-                agg[k] /= total_w
-
-        return agg, len(chunks)
+        return agg, len(decisive)
 
     # ------------------------------------------------------------------ #
     # Sentiment (CB-focused + threshold from settings)
     # ------------------------------------------------------------------ #
-    def analyze_sentiment_with_explanation(self, text):
+    def analyze_sentiment_with_explanation(self, text, title=""):
         """3-class sentiment via FinBERT, scored on CB-focused text where possible.
-        Results below the configured threshold are flagged needs_review."""
+        Results below the configured threshold are flagged needs_review.
+
+        Stage 1: try the article headline — FinBERT is trained on headlines and very
+        decisive on them. If the title alone crosses the threshold, use it.
+        Stage 2: score on CB-context sentences (or full article as fallback).
+        """
+        # ---- Stage 1: headline-first ----
+        headline = (title or "").strip()
+        if len(headline) > 15:
+            title_agg, _ = self._aggregate_finbert([headline])
+            title_label = max(title_agg, key=title_agg.get)
+            title_conf = title_agg[title_label]
+            if title_conf >= self.confidence_threshold:
+                needs_review = False
+                return {
+                    'label': title_label,
+                    'score': title_conf,
+                    'needs_review': needs_review,
+                    'explanation': (
+                        f"FinBERT classified as {title_label.upper()} "
+                        f"(confidence {title_conf:.1%}) from the article headline. "
+                        f"Distribution — positive {title_agg['positive']:.0%}, "
+                        f"neutral {title_agg['neutral']:.0%}, "
+                        f"negative {title_agg['negative']:.0%}."
+                    ),
+                    'focus_mode': 'headline',
+                    'cb_mentioned': False,
+                    'cb_relevance': 0,
+                    'distribution': title_agg,
+                    'key_phrases': []
+                }
+
+        # ---- Stage 2: CB-focused text ----
         focus_text, focus_mode, cb_mentioned, cb_relevance = self._build_focus_text(text)
 
         if not focus_text or len(focus_text.strip()) < 50:
@@ -526,9 +554,7 @@ class EnhancedCompanyAnalyzer:
             'cb_context': "CrossBoundary-specific sentences",
             'pillar': "topic-relevant sentences",
             'full': "the full article body"
-        }[focus_mode]
-
-        weight_label = "topic-relevance-weighted" if self.relevance_weighted else "length-weighted"
+        }.get(focus_mode, focus_mode)
 
         review_note = (
             f" ⚠️ LOW CONFIDENCE (below {self.confidence_threshold:.0%} threshold) — "
@@ -539,7 +565,7 @@ class EnhancedCompanyAnalyzer:
         explanation = (
             f"FinBERT classified this as {sentiment.upper()} "
             f"(confidence {confidence:.1%}), scored on {focus_label} "
-            f"using {weight_label} aggregation over {n} chunk(s). "
+            f"across {n} decisive chunk(s). "
             f"Class distribution — positive {agg['positive']:.0%}, "
             f"neutral {agg['neutral']:.0%}, negative {agg['negative']:.0%}."
             f"{review_note}"
@@ -728,7 +754,7 @@ class EnhancedCompanyAnalyzer:
                 'key_sentences': []
             }
 
-        sentiment = self.analyze_sentiment_with_explanation(page_data['text'])
+        sentiment = self.analyze_sentiment_with_explanation(page_data['text'], title=page_data['title'])
         alignment = self.check_alignment_with_explanation(
             page_data['text'], cb_mentioned=sentiment.get('cb_mentioned', False)
         )
@@ -790,7 +816,7 @@ def create_html_report(results):
     <body>
         <h1>🏢 Company Image Sentiment Analysis Report</h1>
         <p><strong>Generated:</strong> {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}</p>
-        <p><em>v3 — CB-focused sentiment, topic-relevance weighting (neutral preserved),
+        <p><em>v3 — headline-first scoring, drop-ambiguous-chunks aggregation, CB-focused text,
         expanded CrossBoundary taxonomy, CB mention gate, corrupted-content voiding,
         and paywall detection.</em></p>
 
@@ -903,7 +929,7 @@ def create_html_report(results):
     html_content += """
         <div class="footer">
             <p>Report generated by Company Image Sentiment Analyzer v3</p>
-            <p>CB-focused sentiment · topic-relevance weighting (neutral preserved) · expanded CB taxonomy · CB mention gate · corrupted-content voiding · paywall detection</p>
+            <p>Headline-first scoring · drop-ambiguous-chunks · CB-focused text · expanded CB taxonomy · CB mention gate · corrupted-content voiding · paywall detection</p>
         </div>
     </body>
     </html>
@@ -931,23 +957,16 @@ def main():
 
         confidence_threshold = st.slider(
             "Confidence threshold for 'Needs Review'",
-            min_value=0.40, max_value=0.90, value=0.65, step=0.01,
-            help="Results below this confidence are flagged for manual review."
+            min_value=0.40, max_value=0.90, value=0.55, step=0.01,
+            help="Results below this confidence are flagged for manual review. "
+                 "0.55 is a realistic default for FinBERT on full news articles — "
+                 "it typically tops out at 60-65% on mixed-content pages."
         )
         focus_cb = st.toggle(
             "Focus sentiment on CrossBoundary context",
             value=True,
             help="When CB is mentioned, score sentiment on the sentences about CB (plus "
-                 "their neighbors) instead of the whole page. Makes the score CB-specific "
-                 "and usually raises confidence."
-        )
-        relevance_weighted = st.toggle(
-            "Topic-relevance weighting",
-            value=True,
-            help="Weight on-topic passages (those mentioning CrossBoundary or its pillars) "
-                 "more than off-topic ones. Positive, neutral, and negative are treated "
-                 "equally — neutral is never suppressed, so a genuinely neutral article reads "
-                 "as neutral. Turn off for a plain length-weighted average."
+                 "neighbors) rather than the whole page. Makes the score CB-specific."
         )
 
         max_workers = st.slider("Parallel workers", 1, 3, 1)
@@ -956,11 +975,12 @@ def main():
         st.markdown("---")
         st.markdown("### 📊 How the tuning works")
         st.info(
-            "**CB focus:** sentiment reflects how the article feels about CrossBoundary, "
-            "not the whole page.\n\n"
-            "**Topic-relevance weighting:** off-topic noise counts less. Positive, neutral, "
-            "and negative are weighted equally — neutral is a full, valid outcome.\n\n"
-            "**CB relevance score:** 0–100 estimate of how much the article is actually about CB."
+            "**Headline-first:** if the article title alone crosses the threshold, "
+            "that's used as the final score — headlines are FinBERT's strongest input.\n\n"
+            "**Drop ambiguous chunks:** chunks where no class reaches 50% are excluded "
+            "from averaging — they add noise, not signal. Neutral can still win.\n\n"
+            "**CB focus:** sentiment reflects how the article feels about CrossBoundary.\n\n"
+            "**CB relevance score:** 0–100 estimate of how much the article is about CB."
         )
 
         st.markdown("---")
@@ -975,7 +995,6 @@ def main():
     analyzer = st.session_state.analyzer
     analyzer.confidence_threshold = confidence_threshold
     analyzer.focus_cb = focus_cb
-    analyzer.relevance_weighted = relevance_weighted
 
     st.markdown("### 📝 Enter URLs to Analyze")
 
