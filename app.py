@@ -129,6 +129,51 @@ CB_CONTEXT_TERMS = [
     "power", "access", "crossboundary", "fund", "grid"
 ]
 
+# ------------------------------------------------------------------ #
+# Coverage type classification constants
+# ------------------------------------------------------------------ #
+
+# CrossBoundary-owned publishing domains
+CB_OWNED_DOMAINS = [
+    "crossboundary.com", "crossboundaryenergy.com",
+    "crossboundary.energy", "crossboundaryaccess.com",
+]
+
+# Paid PR wire / press release distribution services → treated as Owned
+PR_WIRE_DOMAINS = [
+    "prnewswire.com", "businesswire.com", "globenewswire.com",
+    "accesswire.com", "prweb.com", "einpresswire.com", "newswire.com",
+    "presswire.com", "send2press.com",
+]
+
+# Proactive signal patterns — CB-initiated coverage indicators
+# Checked against lowercase article body text
+PROACTIVE_PATTERNS = [
+    # Formal announcement language
+    (r'\b(?:announces|announced|today announced|is pleased to announce)\b',
+     "announcement language"),
+    # "About CrossBoundary" company boilerplate — classic press release footer
+    (r'\babout crossboundary\b',
+     "company boilerplate ('About CrossBoundary') detected"),
+    # Press release headers / footers
+    (r'\bfor immediate release\b',
+     "press release header detected"),
+    (r'\bpress release\b',
+     "press release label detected"),
+    # CB executive directly quoted: "said [Name], [title]... CrossBoundary"
+    # or "CrossBoundary's [title] said"
+    (r'said\s+\w[\w\s]{2,30},\s*(?:ceo|cfo|coo|founder|co-founder|director|'
+     r'head|partner|manager|associate|analyst)\s+(?:of\s+|at\s+)?crossboundary',
+     "CB executive quoted"),
+    (r'crossboundary(?:\s+energy|\s+advisory|\s+access|\s+group)?'
+     r'[\'s]*\s+(?:ceo|cfo|coo|founder|co-founder|director|head|partner)',
+     "CB executive title attributed"),
+    # Generic "crossboundary said" / "crossboundary noted"
+    (r'crossboundary(?:\s+energy|\s+advisory|\s+access|\s+group)?\s+'
+     r'(?:said|noted|stated|confirmed|commented|added)',
+     "CB organisation statement"),
+]
+
 
 @st.cache_resource
 def load_sentiment_model():
@@ -392,6 +437,69 @@ class EnhancedCompanyAnalyzer:
         A single mention — including a quoted CB member statement — counts."""
         sentences = [s.strip() for s in re.split(r'(?<=[.!?])\s+', text) if s.strip()]
         return any(self._cb_sentence_match(s.lower()) for s in sentences)
+
+    # ------------------------------------------------------------------ #
+    # Coverage type classification
+    # ------------------------------------------------------------------ #
+    def classify_coverage_type(self, url, text, cb_mentioned):
+        """Classify coverage as Owned / Proactive / Earned / Unknown.
+
+        Owned    — published on CB's own channels or via a paid PR wire service.
+        Proactive— CB-initiated earned coverage: announcement language, CB exec quoted,
+                   or 'About CrossBoundary' company boilerplate found.
+        Earned   — independent third-party coverage where CB is mentioned but CB
+                   did not directly initiate the piece.
+        Unknown  — paywalled, failed extraction, or CB not mentioned.
+        """
+        url_lower = (url or "").lower()
+        text_lower = (text or "").lower()
+
+        # ---- 1. Owned: CB's own publishing domains ----
+        if any(domain in url_lower for domain in CB_OWNED_DOMAINS):
+            return {
+                'type': 'Owned',
+                'icon': '🏠',
+                'reason': 'Published on a CrossBoundary-owned domain'
+            }
+
+        # ---- 2. Owned: paid PR wire / press release distribution ----
+        if any(domain in url_lower for domain in PR_WIRE_DOMAINS):
+            return {
+                'type': 'Owned',
+                'icon': '🏠',
+                'reason': 'Distributed via a paid PR wire service'
+            }
+
+        # ---- 3. Can't classify without article content ----
+        if not text_lower:
+            return {
+                'type': 'Unknown',
+                'icon': '❓',
+                'reason': 'No article content available (paywalled or failed extraction)'
+            }
+
+        if not cb_mentioned:
+            return {
+                'type': 'Unknown',
+                'icon': '❓',
+                'reason': 'CrossBoundary not mentioned — coverage type indeterminate'
+            }
+
+        # ---- 4. Proactive: CB-initiated signals ----
+        for pattern, label in PROACTIVE_PATTERNS:
+            if re.search(pattern, text_lower):
+                return {
+                    'type': 'Proactive',
+                    'icon': '📣',
+                    'reason': f'CB-initiated signal: {label}'
+                }
+
+        # ---- 5. Earned: CB mentioned in independent third-party coverage ----
+        return {
+            'type': 'Earned',
+            'icon': '📰',
+            'reason': 'CB mentioned in independent third-party coverage'
+        }
 
     # ------------------------------------------------------------------ #
     # CB-focused sentence selection (drives both CB-tuning and confidence)
@@ -749,6 +857,8 @@ class EnhancedCompanyAnalyzer:
                               'explanation': 'Paywalled — content unavailable', 'matches': []},
                 'outcomes': {'outcomes': [], 'cb_mentioned': False,
                              'explanation': 'Paywalled — manual entry required'},
+                'coverage': {'type': 'Unknown', 'icon': '❓',
+                             'reason': 'Paywalled — content unavailable'},
                 'key_sentences': []
             }
 
@@ -771,6 +881,7 @@ class EnhancedCompanyAnalyzer:
                               'explanation': explanation},
                 'alignment': {'status': 'NO', 'score': 0, 'explanation': explanation, 'matches': []},
                 'outcomes': {'outcomes': [], 'cb_mentioned': False, 'explanation': explanation},
+                'coverage': {'type': 'Unknown', 'icon': '❓', 'reason': explanation},
                 'key_sentences': []
             }
 
@@ -783,6 +894,11 @@ class EnhancedCompanyAnalyzer:
             sentiment['label'],
             alignment['pillars']
         )
+        coverage = self.classify_coverage_type(
+            url,
+            page_data['text'],
+            cb_mentioned=sentiment.get('cb_mentioned', False)
+        )
 
         return {
             'url': url,
@@ -794,6 +910,7 @@ class EnhancedCompanyAnalyzer:
             'sentiment': sentiment,
             'alignment': alignment,
             'outcomes': outcomes,
+            'coverage': coverage,
             'key_sentences': page_data['key_sentences'][:5],
             'text_preview': page_data['text'][:300] + "..."
         }
@@ -831,6 +948,10 @@ def create_html_report(results):
             .badge-review {{ background: #f39c12; color: white; padding: 2px 8px; border-radius: 10px; font-size: 11px; margin-left: 8px; }}
             .badge-paywall {{ background: #e74c3c; color: white; padding: 2px 8px; border-radius: 10px; font-size: 11px; margin-left: 8px; }}
             .badge-cb {{ background: #27ae60; color: white; padding: 2px 8px; border-radius: 10px; font-size: 11px; margin-left: 8px; }}
+            .coverage-owned {{ color: #2980b9; font-weight: bold; }}
+            .coverage-proactive {{ color: #8e44ad; font-weight: bold; }}
+            .coverage-earned {{ color: #27ae60; font-weight: bold; }}
+            .coverage-unknown {{ color: #95a5a6; font-weight: bold; }}
         </style>
     </head>
     <body>
@@ -862,11 +983,15 @@ def create_html_report(results):
         neg_count = sum(1 for r in successful if r['sentiment']['label'] == 'negative')
         neu_count = sum(1 for r in successful if r['sentiment']['label'] == 'neutral')
         aligned_count = sum(1 for r in successful if r['alignment']['status'] == 'YES')
+        owned_count = sum(1 for r in results if r.get('coverage', {}).get('type') == 'Owned')
+        proactive_count = sum(1 for r in results if r.get('coverage', {}).get('type') == 'Proactive')
+        earned_count = sum(1 for r in results if r.get('coverage', {}).get('type') == 'Earned')
 
         html_content += f"<p><strong>Positive Sentiment:</strong> {pos_count}</p>"
         html_content += f"<p><strong>Negative Sentiment:</strong> {neg_count}</p>"
         html_content += f"<p><strong>Neutral Sentiment:</strong> {neu_count}</p>"
         html_content += f"<p><strong>Strong Alignment:</strong> {aligned_count}</p>"
+        html_content += f"<p><strong>🏠 Owned:</strong> {owned_count} &nbsp; <strong>📣 Proactive:</strong> {proactive_count} &nbsp; <strong>📰 Earned:</strong> {earned_count}</p>"
 
     html_content += "</div>"
 
@@ -903,6 +1028,8 @@ def create_html_report(results):
         needs_review_flag = result['sentiment'].get('needs_review', False)
         cb_flag = result['outcomes'].get('cb_mentioned', False)
         cb_relevance = result['sentiment'].get('cb_relevance', 0)
+        coverage = result.get('coverage', {'type': 'Unknown', 'icon': '❓', 'reason': ''})
+        coverage_class = f"coverage-{coverage['type'].lower()}"
 
         review_badge = '<span class="badge-review">⚠️ NEEDS REVIEW</span>' if needs_review_flag else ''
         cb_badge = '<span class="badge-cb">CB MENTIONED</span>' if cb_flag else ''
@@ -911,6 +1038,12 @@ def create_html_report(results):
         <div class="article">
             <h3>{idx}. {result['title']} {review_badge} {cb_badge}</h3>
             <p><strong>URL:</strong> <a href="{result['url']}">{result['url']}</a></p>
+
+            <h4>📡 Coverage Type</h4>
+            <div class="explanation">
+                <p><strong>Type:</strong> <span class="{coverage_class}">{coverage['icon']} {coverage['type'].upper()}</span></p>
+                <p><strong>Reason:</strong> {coverage['reason']}</p>
+            </div>
 
             <h4>🎭 Sentiment Analysis</h4>
             <div class="{'needs-review' if needs_review_flag else 'explanation'}">
@@ -1079,6 +1212,8 @@ def main():
                 'Alignment': r['alignment']['status'] if not r.get('error') else 'N/A',
                 'Alignment Score': r['alignment'].get('score', 0) if not r.get('error') else 0,
                 'CB Mentioned': r['outcomes'].get('cb_mentioned', False) if not r.get('error') else False,
+                'Coverage Type': r.get('coverage', {}).get('type', 'Unknown'),
+                'Coverage Reason': r.get('coverage', {}).get('reason', ''),
                 'Outcomes': ', '.join([o['outcome'] for o in r['outcomes']['outcomes']]) if not r.get('error') and r['outcomes']['outcomes'] else '',
                 'Paywall': r.get('paywall', False),
                 'Explanation': r['sentiment']['explanation'] if not r.get('error') else ''
@@ -1142,6 +1277,21 @@ def display_detailed_results(results):
         avg_confidence = sum(r['sentiment']['score'] for r in successful) / len(successful) if successful else 0
         st.metric("📊 Avg Confidence", f"{avg_confidence:.1%}")
 
+    # Coverage type breakdown
+    col_a, col_b, col_c, col_d = st.columns(4)
+    with col_a:
+        owned = sum(1 for r in results if r.get('coverage', {}).get('type') == 'Owned')
+        st.metric("🏠 Owned", owned)
+    with col_b:
+        proactive = sum(1 for r in results if r.get('coverage', {}).get('type') == 'Proactive')
+        st.metric("📣 Proactive", proactive)
+    with col_c:
+        earned = sum(1 for r in results if r.get('coverage', {}).get('type') == 'Earned')
+        st.metric("📰 Earned", earned)
+    with col_d:
+        unknown_cov = sum(1 for r in results if r.get('coverage', {}).get('type') == 'Unknown')
+        st.metric("❓ Unknown", unknown_cov)
+
     st.markdown("---")
 
     review_articles = [r for r in successful if r['sentiment'].get('needs_review', False)]
@@ -1190,6 +1340,20 @@ def display_detailed_results(results):
                 continue
 
             st.markdown(f"**URL:** {result['url']}")
+
+            # Coverage type
+            coverage = result.get('coverage', {'type': 'Unknown', 'icon': '❓', 'reason': ''})
+            cov_colors = {'Owned': '#2980b9', 'Proactive': '#8e44ad',
+                          'Earned': '#27ae60', 'Unknown': '#95a5a6'}
+            cov_color = cov_colors.get(coverage['type'], '#95a5a6')
+            st.markdown(f"""
+            <div class="explanation-box">
+                <strong>📡 Coverage Type:</strong>
+                <span style="color:{cov_color}; font-weight:bold;">
+                {coverage['icon']} {coverage['type'].upper()}</span>
+                &nbsp;—&nbsp; {coverage['reason']}
+            </div>
+            """, unsafe_allow_html=True)
 
             if cb_flag:
                 st.success(
