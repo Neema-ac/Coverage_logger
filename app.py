@@ -1,21 +1,33 @@
-# Company Image Sentiment Analyzer
-# ---------------------------------
+# Company Image Sentiment Analyzer  (CB-tuned, v3)
+# ------------------------------------------------
 # Install:
 #   pip install streamlit trafilatura transformers torch beautifulsoup4 requests pandas reportlab
 #
 # Run:
 #   streamlit run company_sentiment_analyzer.py
 #
-# Fixes applied (v2):
-#   1. Confidence threshold — results below 65% flagged as "Needs Review" in UI, CSV, and HTML.
-#   2. Expanded keyword lists — Energy Access, Climate Finance, Frontier Investment pillars
-#      now cover C&I solar, energy infrastructure, sub-Saharan, battery storage, etc.
-#   3. CB mention gate — Business Outcomes only tagged when CrossBoundary is mentioned
-#      in the article; sector/industry articles no longer pick up false-positive outcomes.
-#   4. Corrupted content detection — binary/garbled extraction (>25% non-ASCII) voids the
-#      result instead of silently producing a meaningless sentiment score.
-#   5. Paywall distinction — FT, WSJ, Bloomberg etc. flagged as "Paywall — manual entry
-#      required" rather than a generic fetch failure.
+# What changed in v3 (the two things you asked for):
+#
+#   A. MORE IN TUNE WITH CB
+#      - Expanded CB entity list to CrossBoundary's real brands/acronyms:
+#        CBE, CBEA, CrossBoundary Access/Energy/Advisory/Group, Fund for Nature, Frontier platform.
+#      - Refined pillar keywords to CB's own language (blended finance, mini-grids,
+#        24/7 grid-quality power, bankable, offtake, MIGA guarantee, carbon markets,
+#        nature-based solutions, concessional finance, etc.).
+#      - NEW: CB-focused sentiment. When CB is mentioned, sentiment is scored on the
+#        sentences that talk about CB (plus their neighbors) instead of the whole page,
+#        so the score reflects how the article feels ABOUT CB specifically.
+#      - NEW: 0-100 CB alignment score with a direct-mention boost.
+#
+#   B. HIGHER CONFIDENCE (honestly, without suppressing neutral)
+#      - NEW: topic-relevance weighting. Each chunk is weighted by length AND by whether
+#        it is on-topic (mentions CrossBoundary or a positioning keyword). Off-topic noise
+#        counts less, so confidence rises — but positive, neutral, and negative are all
+#        treated EQUALLY. Neutral is a first-class outcome and is never down-weighted.
+#      - The 65% threshold is no longer hardcoded — it's a sidebar slider you can tune live.
+#
+#   Carried over from v2: confidence flagging, CB mention gate on outcomes,
+#   corrupted-content voiding, paywall detection.
 
 import streamlit as st
 import requests
@@ -84,18 +96,34 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # ------------------------------------------------------------------ #
-# Known paywall domains — Fix 5
+# Known paywall domains
 # ------------------------------------------------------------------ #
 PAYWALL_DOMAINS = [
     'ft.com', 'wsj.com', 'bloomberg.com', 'economist.com',
     'nytimes.com', 'washingtonpost.com', 'thetimes.co.uk'
 ]
 
-# CrossBoundary name variants — Fix 3
+# ------------------------------------------------------------------ #
+# CrossBoundary entity variants (expanded to CB's real brands).
+# Multi-word forms are unambiguous; the short acronyms (cbe, cbea) are kept
+# with strict word boundaries so they only match as standalone tokens.
+# ------------------------------------------------------------------ #
 CB_NAMES = [
-    "crossboundary", "cross boundary", "cb energy",
-    "cb advisory", "cb access", "crossboundary energy",
-    "crossboundary advisory", "crossboundary group"
+    "crossboundary", "cross boundary", "cross-boundary",
+    "crossboundary group", "crossboundary advisory", "crossboundary energy",
+    "crossboundary energy access", "crossboundary access",
+    "cb energy", "cb advisory", "cb access",
+    "cbe", "cbea",
+    "fund for nature",
+]
+
+# CB sub-brand acronyms that are risky as bare tokens get extra context guarding.
+# We only treat "cbe"/"cbea" as CB when they appear near energy/access/Africa context,
+# to avoid matching unrelated uses. Handled in _cb_sentence_match().
+CB_AMBIGUOUS = {"cbe", "cbea"}
+CB_CONTEXT_TERMS = [
+    "energy", "mini-grid", "minigrid", "solar", "africa", "renewable",
+    "power", "access", "crossboundary", "fund", "grid"
 ]
 
 
@@ -107,49 +135,71 @@ def load_sentiment_model():
 
 
 class EnhancedCompanyAnalyzer:
-    """Analyzer with explainability features and accuracy fixes."""
+    """Analyzer with explainability features, CB tuning, and confidence upgrades."""
 
     def __init__(self):
         self.model = load_sentiment_model()
 
+        # ---- Tunable settings (overridden from the sidebar before each run) ----
+        self.confidence_threshold = 0.65   # below this => "Needs Review"
+        self.focus_cb = True               # score sentiment on CB-context sentences
+        self.relevance_weighted = True     # weight on-topic chunks more (direction-neutral)
+        self.neighbor_window = 1           # sentences to include on each side of a CB hit
+
         # ------------------------------------------------------------------ #
-        # Fix 2 — Expanded positioning pillar keyword lists
+        # Positioning pillars — refined to CrossBoundary's own language
         # ------------------------------------------------------------------ #
         self.positioning_pillars = {
             "frontier_investment": {
                 "keywords": [
-                    "frontier market", "emerging market", "high growth", "early stage",
-                    "venture", "private equity", "innovative finance", "risk capital",
-                    "sub-saharan", "africa investment", "development finance", "dfi",
-                    "blended finance", "impact investing", "frontier investment"
+                    "frontier market", "emerging market", "emerging and frontier",
+                    "early stage", "venture", "private equity", "innovative finance",
+                    "risk capital", "sub-saharan", "africa investment",
+                    "development finance", "dfi", "blended finance", "impact investing",
+                    "frontier investment", "frontier platform", "green sme",
+                    "de-risk", "concessional finance", "bankable", "bankable project",
+                    "offtake", "offtake agreement", "miga", "guarantee structure",
+                    "private capital", "catalytic capital"
                 ],
                 "weight": 1.0,
                 "description": "Content discusses investment in frontier/emerging markets"
             },
-            "climate_finances": {
+            "climate_finance": {
                 "keywords": [
-                    "climate finance", "green bond", "carbon credit", "renewable energy",
-                    "decarbonization", "decarbonisation", "net zero", "esg investing",
-                    "clean energy", "energy transition", "green finance", "climate investment",
-                    "solar power", "wind power", "battery storage", "solar and battery",
-                    "clean power", "low carbon"
+                    "climate finance", "green bond", "carbon credit", "carbon market",
+                    "voluntary carbon market", "renewable energy", "decarbonization",
+                    "decarbonisation", "net zero", "esg", "esg investing", "clean energy",
+                    "energy transition", "green finance", "climate investment",
+                    "solar power", "wind power", "hydropower", "battery storage",
+                    "solar and battery", "solar and batteries", "clean power",
+                    "low carbon", "nature-based solution", "nature-based solutions",
+                    "natural capital", "conservation finance", "climate equity",
+                    "climate-aligned", "nationally determined contribution", "ndc"
                 ],
                 "weight": 1.0,
                 "description": "Content focuses on climate finance and green investment"
             },
             "energy_access": {
                 "keywords": [
-                    "energy access", "off-grid", "mini-grid", "clean cooking",
-                    "electricity access", "solar home system", "last mile energy",
-                    "c&i solar", "commercial and industrial", "energy infrastructure",
-                    "power demand", "grid stability", "diesel dependency",
-                    "renewable power", "electricity supply", "power generation",
-                    "energy solution", "power project", "energy platform"
+                    "energy access", "off-grid", "mini-grid", "mini grid", "minigrid",
+                    "clean cooking", "electricity access", "solar home system",
+                    "last mile energy", "c&i solar", "commercial and industrial",
+                    "industrial renewable", "energy infrastructure", "power demand",
+                    "grid stability", "grid-quality power", "24/7 power",
+                    "diesel dependency", "renewable power", "electricity supply",
+                    "power generation", "energy solution", "power project",
+                    "energy platform", "electrification", "rural electrification",
+                    "universal electrification", "solar-powered", "solar powered"
                 ],
                 "weight": 1.0,
                 "description": "Content addresses energy access and distribution"
             }
         }
+
+        # Flat keyword set for fast "any pillar keyword?" checks
+        self._all_pillar_keywords = [
+            kw for cfg in self.positioning_pillars.values() for kw in cfg["keywords"]
+        ]
 
         # Business outcomes with keywords
         self.business_outcomes = {
@@ -160,7 +210,8 @@ class EnhancedCompanyAnalyzer:
             },
             "Investor Narrative": {
                 "keywords": ["funding", "investment", "returns", "roi", "valuation",
-                             "exit", "capital raise", "investor", "fundraise"],
+                             "exit", "capital raise", "investor", "fundraise",
+                             "oversubscribed", "round", "commitment", "raised"],
                 "weight": 1.2,
                 "description": "Strengthens investor confidence or fundraising narrative"
             },
@@ -172,7 +223,7 @@ class EnhancedCompanyAnalyzer:
             },
             "Partnership": {
                 "keywords": ["partner", "partnership", "collaboration", "mou",
-                             "agreement", "strategic alliance"],
+                             "agreement", "strategic alliance", "consortium"],
                 "weight": 1.0,
                 "description": "Indicates potential or existing strategic partnerships"
             },
@@ -206,15 +257,13 @@ class EnhancedCompanyAnalyzer:
     def fetch_page_content(self, url):
         """Fetch a page and extract the clean ARTICLE BODY using trafilatura,
         falling back to a cleaned BeautifulSoup parse if needed.
-        Includes Fix 4 (corrupted content) and Fix 5 (paywall detection)."""
+        Includes corrupted-content and paywall detection."""
         try:
             if not url.startswith(('http://', 'https://')):
                 url = 'https://' + url
 
-            # Fix 5 — Detect known paywall domains before attempting fetch
             is_paywall = any(domain in url for domain in PAYWALL_DOMAINS)
 
-            # 1) Get raw HTML
             html = None
             try:
                 html = trafilatura.fetch_url(url)
@@ -232,7 +281,6 @@ class EnhancedCompanyAnalyzer:
             text = ""
             corrupted = False
 
-            # 2) Primary: trafilatura clean extraction
             extracted = trafilatura.extract(
                 html,
                 include_comments=False,
@@ -245,7 +293,6 @@ class EnhancedCompanyAnalyzer:
                 text = (data.get('text') or "").strip()
                 title = (data.get('title') or "").strip() or title
 
-            # 3) Fallback: BeautifulSoup if trafilatura found little/nothing
             if len(text) < 50:
                 soup = BeautifulSoup(html, 'html.parser')
                 if title == "Untitled Article":
@@ -257,12 +304,12 @@ class EnhancedCompanyAnalyzer:
 
             text = re.sub(r'\s+', ' ', text).strip()
 
-            # Fix 4 — Detect corrupted/binary content (e.g. garbled PDF extraction)
+            # Detect corrupted/binary content (e.g. garbled PDF extraction)
             if len(text) > 0:
                 non_ascii_ratio = sum(1 for c in text if ord(c) > 127) / len(text)
                 if non_ascii_ratio > 0.25:
                     corrupted = True
-                    text = ""  # Void the result — don't analyze garbage
+                    text = ""
                     title = f"Error: Corrupted content extracted from {url}"
 
             title = re.sub(r'\s+', ' ', title)[:100] or "Untitled Article"
@@ -292,7 +339,7 @@ class EnhancedCompanyAnalyzer:
             }
 
     # ------------------------------------------------------------------ #
-    # Helpers
+    # Matching helpers
     # ------------------------------------------------------------------ #
     @staticmethod
     def _chunk_text(text, max_chars=1500, max_chunks=6):
@@ -318,54 +365,183 @@ class EnhancedCompanyAnalyzer:
                 found.append(kw)
         return found
 
+    def _any_pillar_keyword(self, text_lower):
+        return any(
+            re.search(r'\b' + re.escape(kw) + r'\b', text_lower)
+            for kw in self._all_pillar_keywords
+        )
+
+    def _cb_sentence_match(self, sentence_lower):
+        """Return True if this sentence references CrossBoundary.
+        Ambiguous acronyms (cbe/cbea) only count when CB-context terms are nearby."""
+        for name in CB_NAMES:
+            if not re.search(r'\b' + re.escape(name) + r'\b', sentence_lower):
+                continue
+            if name in CB_AMBIGUOUS:
+                if any(re.search(r'\b' + re.escape(t) + r'\b', sentence_lower)
+                       for t in CB_CONTEXT_TERMS):
+                    return True
+                continue
+            return True
+        return False
+
     # ------------------------------------------------------------------ #
-    # Sentiment — Fix 1 (confidence threshold)
+    # CB-focused sentence selection (drives both CB-tuning and confidence)
+    # ------------------------------------------------------------------ #
+    def _build_focus_text(self, text):
+        """Choose which text to feed FinBERT.
+
+        Returns (focus_text, focus_mode, cb_mentioned, cb_relevance):
+          - 'cb_context'  : sentences mentioning CB (+ neighbors)        [best signal]
+          - 'pillar'      : sentences with pillar keywords               [topic-level]
+          - 'full'        : whole article                                [fallback]
+        """
+        sentences = re.split(r'(?<=[.!?])\s+', text)
+        sentences = [s.strip() for s in sentences if s.strip()]
+        if not sentences:
+            return text, 'full', False, 0
+
+        lowered = [s.lower() for s in sentences]
+        cb_idx = [i for i, s in enumerate(lowered) if self._cb_sentence_match(s)]
+        pillar_idx = [i for i, s in enumerate(lowered) if self._any_pillar_keyword(s)]
+
+        cb_mentioned = len(cb_idx) > 0
+
+        # CB relevance: how much of the article is actually about CB / its pillars (0-100)
+        if cb_mentioned:
+            density = (len(cb_idx) + 0.5 * len(set(pillar_idx) - set(cb_idx))) / max(len(sentences), 1)
+            cb_relevance = int(min(100, 50 + density * 200))  # direct mention floors at ~50
+        elif pillar_idx:
+            cb_relevance = int(min(45, len(pillar_idx) / max(len(sentences), 1) * 180))
+        else:
+            cb_relevance = 0
+
+        # Pick the focus set
+        if self.focus_cb and cb_idx:
+            keep = set()
+            for i in cb_idx:
+                for j in range(i - self.neighbor_window, i + self.neighbor_window + 1):
+                    if 0 <= j < len(sentences):
+                        keep.add(j)
+            focus_text = " ".join(sentences[j] for j in sorted(keep))
+            mode = 'cb_context'
+        elif pillar_idx:
+            keep = set()
+            for i in pillar_idx:
+                for j in range(i - self.neighbor_window, i + self.neighbor_window + 1):
+                    if 0 <= j < len(sentences):
+                        keep.add(j)
+            focus_text = " ".join(sentences[j] for j in sorted(keep))
+            mode = 'pillar'
+        else:
+            focus_text = text
+            mode = 'full'
+
+        # Guard against an over-thin focus set
+        if len(focus_text.strip()) < 50:
+            focus_text = text
+            mode = 'full'
+
+        return focus_text, mode, cb_mentioned, cb_relevance
+
+    # ------------------------------------------------------------------ #
+    # FinBERT aggregation (topic-relevance weighting; neutral treated equally)
+    # ------------------------------------------------------------------ #
+    def _aggregate_finbert(self, chunks):
+        """Run FinBERT on each chunk and combine into one distribution.
+
+        All three classes (positive / neutral / negative) are treated EQUALLY here —
+        neutral is a first-class outcome and is never suppressed. The argmax over the
+        averaged distribution decides the label, so a genuinely neutral article reads
+        as neutral.
+
+        relevance_weighted=True: weight = length * relevance, where relevance is higher
+        for on-topic chunks (those mentioning CrossBoundary or a positioning keyword).
+        This focuses the score on relevant passages WITHOUT favoring any sentiment
+        direction. relevance_weighted=False: plain length-weighted average.
+        """
+        agg = {'positive': 0.0, 'negative': 0.0, 'neutral': 0.0}
+        total_w = 0.0
+        per_chunk = []
+
+        for ch in chunks:
+            out = self.model(ch, truncation=True, max_length=512, top_k=None)
+            scores = out[0] if out and isinstance(out[0], list) else out
+            dist = {}
+            for s in scores:
+                dist[s['label'].lower()] = float(s['score'])
+            for k in ('positive', 'negative', 'neutral'):
+                dist.setdefault(k, 0.0)
+            per_chunk.append(dist)
+
+            if self.relevance_weighted:
+                ch_lower = ch.lower()
+                on_topic = self._cb_sentence_match(ch_lower) or self._any_pillar_keyword(ch_lower)
+                relevance = 1.0 if on_topic else 0.35   # off-topic counts less; sentiment-agnostic
+                w = len(ch) * relevance + 1e-6
+            else:
+                w = float(len(ch)) + 1e-6
+            total_w += w
+            for k in agg:
+                agg[k] += dist[k] * w
+
+        if total_w <= 1e-5:
+            n = max(len(per_chunk), 1)
+            agg = {k: sum(d[k] for d in per_chunk) / n for k in agg}
+        else:
+            for k in agg:
+                agg[k] /= total_w
+
+        return agg, len(chunks)
+
+    # ------------------------------------------------------------------ #
+    # Sentiment (CB-focused + threshold from settings)
     # ------------------------------------------------------------------ #
     def analyze_sentiment_with_explanation(self, text):
-        """3-class sentiment via FinBERT, averaged over chunks.
-        Fix 1: results with confidence < 65% flagged as needs_review."""
-        if not text or len(text.strip()) < 50:
+        """3-class sentiment via FinBERT, scored on CB-focused text where possible.
+        Results below the configured threshold are flagged needs_review."""
+        focus_text, focus_mode, cb_mentioned, cb_relevance = self._build_focus_text(text)
+
+        if not focus_text or len(focus_text.strip()) < 50:
             return {
                 'label': 'neutral',
                 'score': 0.5,
                 'needs_review': True,
                 'explanation': 'Insufficient content to analyze sentiment.',
+                'focus_mode': 'full',
+                'cb_mentioned': cb_mentioned,
+                'cb_relevance': cb_relevance,
+                'distribution': {'positive': 0.0, 'negative': 0.0, 'neutral': 1.0},
                 'key_phrases': []
             }
 
-        chunks = self._chunk_text(text)
-        agg = {'positive': 0.0, 'negative': 0.0, 'neutral': 0.0}
-
-        for ch in chunks:
-            out = self.model(ch, truncation=True, max_length=512, top_k=None)
-            scores = out[0] if out and isinstance(out[0], list) else out
-            for s in scores:
-                lab = s['label'].lower()
-                if lab in agg:
-                    agg[lab] += float(s['score'])
-
-        n = max(len(chunks), 1)
-        for k in agg:
-            agg[k] /= n
+        chunks = self._chunk_text(focus_text)
+        agg, n = self._aggregate_finbert(chunks)
 
         sentiment = max(agg, key=agg.get)
         confidence = agg[sentiment]
+        needs_review = confidence < self.confidence_threshold
 
-        # Fix 1 — Flag low-confidence results
-        needs_review = confidence < 0.65
+        focus_label = {
+            'cb_context': "CrossBoundary-specific sentences",
+            'pillar': "topic-relevant sentences",
+            'full': "the full article body"
+        }[focus_mode]
+
+        weight_label = "topic-relevance-weighted" if self.relevance_weighted else "length-weighted"
 
         review_note = (
-            " ⚠️ LOW CONFIDENCE — recommend manual review before logging."
+            f" ⚠️ LOW CONFIDENCE (below {self.confidence_threshold:.0%} threshold) — "
+            f"recommend manual review before logging."
             if needs_review else ""
         )
 
         explanation = (
             f"FinBERT classified this as {sentiment.upper()} "
-            f"(confidence {confidence:.1%}). Class distribution — "
-            f"positive {agg['positive']:.0%}, "
-            f"neutral {agg['neutral']:.0%}, "
-            f"negative {agg['negative']:.0%}. "
-            f"Read over {n} text chunk(s) of the extracted article body."
+            f"(confidence {confidence:.1%}), scored on {focus_label} "
+            f"using {weight_label} aggregation over {n} chunk(s). "
+            f"Class distribution — positive {agg['positive']:.0%}, "
+            f"neutral {agg['neutral']:.0%}, negative {agg['negative']:.0%}."
             f"{review_note}"
         )
 
@@ -374,18 +550,22 @@ class EnhancedCompanyAnalyzer:
             'score': confidence,
             'needs_review': needs_review,
             'explanation': explanation,
+            'focus_mode': focus_mode,
+            'cb_mentioned': cb_mentioned,
+            'cb_relevance': cb_relevance,
             'distribution': agg,
             'key_phrases': []
         }
 
     # ------------------------------------------------------------------ #
-    # Positioning — Fix 2 (expanded keywords, already in __init__)
+    # Positioning alignment (now with a 0-100 score + CB boost)
     # ------------------------------------------------------------------ #
-    def check_alignment_with_explanation(self, text):
-        """Check positioning alignment with detailed explanation."""
+    def check_alignment_with_explanation(self, text, cb_mentioned=False):
+        """Check positioning alignment with a numeric CB alignment score."""
         if not text:
             return {
                 'status': 'NO',
+                'score': 0,
                 'pillars': [],
                 'explanation': 'No content available to analyze positioning.',
                 'matches': []
@@ -394,10 +574,14 @@ class EnhancedCompanyAnalyzer:
         text_lower = text.lower()
         matches = []
         explanation_parts = []
+        raw_score = 0.0
 
         for pillar, config in self.positioning_pillars.items():
             matched_keywords = self._match_keywords(text_lower, config['keywords'])
             if matched_keywords:
+                # diminishing returns: first few hits matter most
+                pillar_contrib = config['weight'] * min(len(matched_keywords), 3)
+                raw_score += pillar_contrib
                 matches.append({
                     'pillar': pillar,
                     'keywords': matched_keywords,
@@ -408,36 +592,43 @@ class EnhancedCompanyAnalyzer:
                     f"'{', '.join(matched_keywords[:2])}'"
                 )
 
-        if len(matches) >= 2:
+        # Direct CB mention is a strong positioning signal
+        if cb_mentioned:
+            raw_score += 2.0
+
+        # Normalize to 0-100 (3 pillars * 3 hits * ~1.0 weight + CB boost ~= 11 cap)
+        score = int(min(100, raw_score / 11.0 * 100))
+
+        n_pillars = len(matches)
+        if n_pillars >= 2 or (n_pillars >= 1 and cb_mentioned):
             status = 'YES'
-            explanation = (f"✅ STRONG ALIGNMENT detected! Matched {len(matches)} "
-                           f"core positioning pillars:\n" + "\n".join(explanation_parts))
-        elif len(matches) == 1:
+            explanation = (f"✅ STRONG ALIGNMENT (score {score}/100). Matched {n_pillars} "
+                           f"pillar(s){' + direct CrossBoundary mention' if cb_mentioned else ''}:\n"
+                           + "\n".join(explanation_parts))
+        elif n_pillars == 1:
             status = 'PARTIAL'
-            explanation = ("🟡 PARTIAL ALIGNMENT detected. Matched 1 core "
-                           "positioning pillar:\n" + "\n".join(explanation_parts))
+            explanation = (f"🟡 PARTIAL ALIGNMENT (score {score}/100). Matched 1 pillar:\n"
+                           + "\n".join(explanation_parts))
         else:
             status = 'NO'
-            explanation = ("❌ NO ALIGNMENT detected. The content doesn't match "
-                           "frontier investment, climate finances, or energy access keywords.")
+            explanation = ("❌ NO ALIGNMENT detected. Content doesn't match frontier "
+                           "investment, climate finance, or energy access language.")
 
         return {
             'status': status,
+            'score': score,
             'pillars': [m['pillar'] for m in matches],
             'explanation': explanation,
             'matches': matches
         }
 
     # ------------------------------------------------------------------ #
-    # Business outcomes — Fix 3 (CB mention gate)
+    # Business outcomes (CB mention gate retained)
     # ------------------------------------------------------------------ #
     def determine_outcomes_with_explanation(self, text, sentiment, matched_pillars):
-        """Determine business outcomes.
-        Fix 3: only tag outcomes when CrossBoundary is mentioned in the article."""
+        """Determine business outcomes; only tag when CrossBoundary is mentioned."""
         text_lower = text.lower()
-
-        # Fix 3 — CB mention gate
-        cb_mentioned = any(name in text_lower for name in CB_NAMES)
+        cb_mentioned = self._cb_sentence_match(text_lower)
 
         if not cb_mentioned:
             return {
@@ -497,7 +688,6 @@ class EnhancedCompanyAnalyzer:
         """Complete analysis pipeline with all fixes applied."""
         page_data = self.fetch_page_content(url)
 
-        # Fix 5 — Distinguish paywall from generic failure
         if page_data.get('is_paywall') and not page_data['text']:
             return {
                 'url': url,
@@ -506,17 +696,16 @@ class EnhancedCompanyAnalyzer:
                 'error': True,
                 'paywall': True,
                 'corrupted': False,
-                'sentiment': {'label': 'neutral', 'score': 0.0,
-                              'needs_review': True,
+                'sentiment': {'label': 'neutral', 'score': 0.0, 'needs_review': True,
+                              'cb_mentioned': False, 'cb_relevance': 0, 'focus_mode': 'full',
                               'explanation': 'Paywalled article — manual entry required'},
-                'alignment': {'status': 'NO', 'explanation': 'Paywalled — content unavailable',
-                              'matches': []},
+                'alignment': {'status': 'NO', 'score': 0,
+                              'explanation': 'Paywalled — content unavailable', 'matches': []},
                 'outcomes': {'outcomes': [], 'cb_mentioned': False,
                              'explanation': 'Paywalled — manual entry required'},
                 'key_sentences': []
             }
 
-        # Fix 4 — Corrupted content
         if page_data.get('corrupted') or not page_data['text']:
             status = 'Corrupted' if page_data.get('corrupted') else 'Failed'
             explanation = (
@@ -531,15 +720,18 @@ class EnhancedCompanyAnalyzer:
                 'error': True,
                 'paywall': False,
                 'corrupted': page_data.get('corrupted', False),
-                'sentiment': {'label': 'neutral', 'score': 0.0,
-                              'needs_review': True, 'explanation': explanation},
-                'alignment': {'status': 'NO', 'explanation': explanation, 'matches': []},
+                'sentiment': {'label': 'neutral', 'score': 0.0, 'needs_review': True,
+                              'cb_mentioned': False, 'cb_relevance': 0, 'focus_mode': 'full',
+                              'explanation': explanation},
+                'alignment': {'status': 'NO', 'score': 0, 'explanation': explanation, 'matches': []},
                 'outcomes': {'outcomes': [], 'cb_mentioned': False, 'explanation': explanation},
                 'key_sentences': []
             }
 
         sentiment = self.analyze_sentiment_with_explanation(page_data['text'])
-        alignment = self.check_alignment_with_explanation(page_data['text'])
+        alignment = self.check_alignment_with_explanation(
+            page_data['text'], cb_mentioned=sentiment.get('cb_mentioned', False)
+        )
         outcomes = self.determine_outcomes_with_explanation(
             page_data['text'],
             sentiment['label'],
@@ -565,7 +757,7 @@ class EnhancedCompanyAnalyzer:
 # HTML Report
 # ------------------------------------------------------------------ #
 def create_html_report(results):
-    """Create HTML report with all fix indicators surfaced."""
+    """Create HTML report with all status indicators surfaced."""
     html_content = f"""
     <!DOCTYPE html>
     <html>
@@ -598,7 +790,9 @@ def create_html_report(results):
     <body>
         <h1>🏢 Company Image Sentiment Analysis Report</h1>
         <p><strong>Generated:</strong> {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}</p>
-        <p><em>v2 — includes confidence flagging, expanded keywords, CB mention gate, corrupted-content voiding, and paywall detection.</em></p>
+        <p><em>v3 — CB-focused sentiment, topic-relevance weighting (neutral preserved),
+        expanded CrossBoundary taxonomy, CB mention gate, corrupted-content voiding,
+        and paywall detection.</em></p>
 
         <div class="summary">
             <h2>Executive Summary</h2>
@@ -631,7 +825,6 @@ def create_html_report(results):
     html_content += "</div>"
 
     for idx, result in enumerate(results, 1):
-        # Fix 5 — Paywall
         if result.get('paywall'):
             html_content += f"""
             <div class="article">
@@ -645,7 +838,6 @@ def create_html_report(results):
             """
             continue
 
-        # Fix 4 — Corrupted or failed
         if result.get('error', False):
             status_label = "CORRUPTED" if result.get('corrupted') else "FAILED"
             html_content += f"""
@@ -664,6 +856,7 @@ def create_html_report(results):
         alignment_class = f"alignment-{result['alignment']['status'].lower()}"
         needs_review_flag = result['sentiment'].get('needs_review', False)
         cb_flag = result['outcomes'].get('cb_mentioned', False)
+        cb_relevance = result['sentiment'].get('cb_relevance', 0)
 
         review_badge = '<span class="badge-review">⚠️ NEEDS REVIEW</span>' if needs_review_flag else ''
         cb_badge = '<span class="badge-cb">CB MENTIONED</span>' if cb_flag else ''
@@ -683,7 +876,8 @@ def create_html_report(results):
 
             <h4>🎯 Positioning Alignment</h4>
             <div class="explanation">
-                <p><strong>Status:</strong> <span class="{alignment_class}">{result['alignment']['status']}</span></p>
+                <p><strong>Status:</strong> <span class="{alignment_class}">{result['alignment']['status']}</span>
+                (Alignment score: {result['alignment'].get('score', 0)}/100 · CB relevance: {cb_relevance}/100)</p>
                 <p><strong>Explanation:</strong> {result['alignment']['explanation']}</p>
             </div>
 
@@ -708,8 +902,8 @@ def create_html_report(results):
 
     html_content += """
         <div class="footer">
-            <p>Report generated by Company Image Sentiment Analyzer v2</p>
-            <p>Fixes: confidence threshold · expanded keywords · CB mention gate · corrupted content voiding · paywall detection</p>
+            <p>Report generated by Company Image Sentiment Analyzer v3</p>
+            <p>CB-focused sentiment · topic-relevance weighting (neutral preserved) · expanded CB taxonomy · CB mention gate · corrupted-content voiding · paywall detection</p>
         </div>
     </body>
     </html>
@@ -725,7 +919,7 @@ def main():
     st.markdown("""
     <div class="big-title">
         <h1>🏢 Company Image Sentiment Analyzer</h1>
-        <p>FinBERT-powered analysis with clean article extraction</p>
+        <p>FinBERT-powered, CrossBoundary-tuned analysis</p>
     </div>
     """, unsafe_allow_html=True)
 
@@ -733,27 +927,55 @@ def main():
         st.session_state.analyzer = EnhancedCompanyAnalyzer()
 
     with st.sidebar:
-        st.markdown("### ⚙️ Settings")
+        st.markdown("### ⚙️ Tuning Controls")
+
+        confidence_threshold = st.slider(
+            "Confidence threshold for 'Needs Review'",
+            min_value=0.40, max_value=0.90, value=0.65, step=0.01,
+            help="Results below this confidence are flagged for manual review."
+        )
+        focus_cb = st.toggle(
+            "Focus sentiment on CrossBoundary context",
+            value=True,
+            help="When CB is mentioned, score sentiment on the sentences about CB (plus "
+                 "their neighbors) instead of the whole page. Makes the score CB-specific "
+                 "and usually raises confidence."
+        )
+        relevance_weighted = st.toggle(
+            "Topic-relevance weighting",
+            value=True,
+            help="Weight on-topic passages (those mentioning CrossBoundary or its pillars) "
+                 "more than off-topic ones. Positive, neutral, and negative are treated "
+                 "equally — neutral is never suppressed, so a genuinely neutral article reads "
+                 "as neutral. Turn off for a plain length-weighted average."
+        )
+
         max_workers = st.slider("Parallel workers", 1, 3, 1)
         st.caption("Keep at 1 on Streamlit Community Cloud (1 GB RAM) to avoid out-of-memory crashes.")
 
         st.markdown("---")
-        st.markdown("### 📊 Accuracy Notes")
-        st.info("""
-        **Confidence threshold:** Results below 65% are flagged ⚠️ for manual review — don't log these automatically.
-
-        **CB mention gate:** Business Outcomes are only tagged when CrossBoundary appears in the article. Sector news won't produce false-positive outcomes.
-
-        **Paywalled sites** (FT, WSJ, Bloomberg) are flagged for manual entry — the tool won't attempt to guess their content.
-        """)
+        st.markdown("### 📊 How the tuning works")
+        st.info(
+            "**CB focus:** sentiment reflects how the article feels about CrossBoundary, "
+            "not the whole page.\n\n"
+            "**Topic-relevance weighting:** off-topic noise counts less. Positive, neutral, "
+            "and negative are weighted equally — neutral is a full, valid outcome.\n\n"
+            "**CB relevance score:** 0–100 estimate of how much the article is actually about CB."
+        )
 
         st.markdown("---")
         st.markdown("### 💡 Tips")
-        st.info("""
-        - Expand any result to see detailed explanations
-        - Download CSV for bulk review — filter 'Needs Review = TRUE' first
-        - Download HTML for a client-ready report
-        """)
+        st.info(
+            "- Expand any result for the full explanation\n"
+            "- Download CSV and filter 'Needs Review = TRUE' first\n"
+            "- Lower the threshold if too many true-positive CB articles get flagged"
+        )
+
+    # Push current settings onto the analyzer before running
+    analyzer = st.session_state.analyzer
+    analyzer.confidence_threshold = confidence_threshold
+    analyzer.focus_cb = focus_cb
+    analyzer.relevance_weighted = relevance_weighted
 
     st.markdown("### 📝 Enter URLs to Analyze")
 
@@ -786,7 +1008,7 @@ def main():
         results = []
 
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = {executor.submit(st.session_state.analyzer.analyze_url, url): url for url in urls}
+            futures = {executor.submit(analyzer.analyze_url, url): url for url in urls}
             for idx, future in enumerate(as_completed(futures)):
                 result = future.result()
                 results.append(result)
@@ -812,13 +1034,13 @@ def main():
                 'Status': r['status'],
                 'Sentiment': r['sentiment']['label'].upper() if not r.get('error') else 'ERROR',
                 'Confidence': f"{r['sentiment']['score']:.1%}" if not r.get('error') else 'N/A',
-                # Fix 1 — Needs Review column in CSV
                 'Needs Review': r['sentiment'].get('needs_review', True) if not r.get('error') else True,
+                'Focus Mode': r['sentiment'].get('focus_mode', 'full') if not r.get('error') else 'N/A',
+                'CB Relevance': r['sentiment'].get('cb_relevance', 0) if not r.get('error') else 0,
                 'Alignment': r['alignment']['status'] if not r.get('error') else 'N/A',
-                # Fix 3 — CB Mentioned column in CSV
+                'Alignment Score': r['alignment'].get('score', 0) if not r.get('error') else 0,
                 'CB Mentioned': r['outcomes'].get('cb_mentioned', False) if not r.get('error') else False,
                 'Outcomes': ', '.join([o['outcome'] for o in r['outcomes']['outcomes']]) if not r.get('error') and r['outcomes']['outcomes'] else '',
-                # Fix 5 — Paywall flag in CSV
                 'Paywall': r.get('paywall', False),
                 'Explanation': r['sentiment']['explanation'] if not r.get('error') else ''
             } for r in results])
@@ -862,7 +1084,7 @@ def main():
 
 
 def display_detailed_results(results):
-    """Display results with expandable explanations and fix indicators."""
+    """Display results with expandable explanations and status indicators."""
     successful = [r for r in results if not r.get('error', False)]
 
     col1, col2, col3, col4, col5 = st.columns(5)
@@ -875,7 +1097,6 @@ def display_detailed_results(results):
         aligned = sum(1 for r in successful if r['alignment']['status'] == 'YES')
         st.metric("🎯 Strong Alignment", aligned)
     with col4:
-        # Fix 1 — Surface review count in metrics
         review_count = sum(1 for r in successful if r['sentiment'].get('needs_review', False))
         st.metric("⚠️ Needs Review", review_count)
     with col5:
@@ -884,18 +1105,16 @@ def display_detailed_results(results):
 
     st.markdown("---")
 
-    # Fix 1 — Review queue at top
     review_articles = [r for r in successful if r['sentiment'].get('needs_review', False)]
     if review_articles:
         with st.expander(f"⚠️ Manual Review Queue ({len(review_articles)} articles need checking)", expanded=True):
-            st.markdown("These articles have sentiment confidence below 65% and should be reviewed before logging to the coverage tracker.")
+            st.markdown("These articles are below the confidence threshold and should be reviewed before logging.")
             for r in review_articles:
                 st.markdown(
                     f"- **{r['title'][:70]}** — {r['sentiment']['label'].upper()} "
                     f"({r['sentiment']['score']:.1%} confidence) — [link]({r['url']})"
                 )
 
-    # Fix 5 — Paywall queue
     paywall_articles = [r for r in results if r.get('paywall', False)]
     if paywall_articles:
         with st.expander(f"🔒 Paywalled Articles ({len(paywall_articles)} — manual entry required)", expanded=False):
@@ -912,7 +1131,6 @@ def display_detailed_results(results):
         corrupted_flag = result.get('corrupted', False)
         cb_flag = result['outcomes'].get('cb_mentioned', False) if not result.get('error') else False
 
-        # Build expander label with status badges
         status_icon = "✅" if not result.get('error') else ("🔒" if paywall_flag else "❌")
         review_tag = " ⚠️" if needs_review_flag else ""
         cb_tag = " 🏢" if cb_flag else ""
@@ -920,13 +1138,11 @@ def display_detailed_results(results):
 
         with st.expander(f"{status_icon} {idx}. {title_display}{review_tag}{cb_tag}", expanded=False):
 
-            # Fix 5 — Paywall
             if paywall_flag:
                 st.error("🔒 Paywalled article — manual entry required")
                 st.code(result['url'])
                 continue
 
-            # Fix 4 — Corrupted or failed
             if result.get('error'):
                 st.error(f"❌ {result['status']}: {result['title']}")
                 st.code(result['url'])
@@ -936,9 +1152,12 @@ def display_detailed_results(results):
 
             st.markdown(f"**URL:** {result['url']}")
 
-            # Fix 3 — CB mention indicator
             if cb_flag:
-                st.success("🏢 CrossBoundary mentioned — business outcomes tagged")
+                st.success(
+                    f"🏢 CrossBoundary mentioned — outcomes tagged "
+                    f"(CB relevance {result['sentiment'].get('cb_relevance', 0)}/100, "
+                    f"sentiment scored on: {result['sentiment'].get('focus_mode', 'full')})"
+                )
             else:
                 st.info("ℹ️ CrossBoundary not mentioned — sector/industry coverage, outcomes not tagged")
 
@@ -950,7 +1169,7 @@ def display_detailed_results(results):
             }.get(result['sentiment']['label'], 'gray')
 
             box_class = "review-box" if needs_review_flag else "explanation-box"
-            review_warning = "<br><strong>⚠️ Low confidence — manually verify before logging to the coverage tracker.</strong>" if needs_review_flag else ""
+            review_warning = "<br><strong>⚠️ Low confidence — manually verify before logging.</strong>" if needs_review_flag else ""
 
             st.markdown(f"""
             <div class="{box_class}">
@@ -968,7 +1187,8 @@ def display_detailed_results(results):
             st.markdown(f"""
             <div class="explanation-box">
                 <strong>Status:</strong> <span style="color: {alignment_color}; font-weight: bold;">
-                {result['alignment']['status']}</span><br>
+                {result['alignment']['status']}</span>
+                &nbsp;|&nbsp; <strong>Alignment score:</strong> {result['alignment'].get('score', 0)}/100<br>
                 <strong>Explanation:</strong> {result['alignment']['explanation']}
             </div>
             """, unsafe_allow_html=True)
