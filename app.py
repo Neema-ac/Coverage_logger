@@ -5,40 +5,6 @@
 #
 # Run:
 #   streamlit run company_sentiment_analyzer.py
-#
-# What changed in v4 (three coordinated fixes):
-#
-#   1. TITLE EXTRACTION FALLBACK (decoupled from body-extraction failure)
-#      - Previously the BeautifulSoup/meta title fallback only ran when body
-#        extraction nearly failed (len(text) < 50). So when trafilatura got the
-#        body but missed the title, articles fell through as "Untitled Article".
-#      - Now: whenever trafilatura returns no title, we ALWAYS try the soup
-#        fallback (<title> -> og:title -> <h1>), independent of body length.
-#        The soup is built once and reused.
-#      - Site-name suffixes (" | African Mining Market", " - Semafor") are
-#        stripped so the headline is a clean FinBERT input.
-#
-#   2. HEADLINE-FIRST IS NOW CB-GATED  (required alongside fix #1)
-#      - With titles now populated, the old headline-first stage would start
-#        firing on whole-article headlines that have nothing to do with CB —
-#        reintroducing exactly the "wrong CB sentiment" problem from a different
-#        direction. For a CB-SPECIFIC tool that's wrong.
-#      - Now: headline-first only triggers when the headline itself contains a
-#        CrossBoundary name. Otherwise we skip straight to CB-focused body
-#        scoring. Generic topic headlines no longer override CB sentiment.
-#
-#   3. EXCERPT DISPLAY MATCHES THE SCORED TEXT
-#      - Previously "Key Excerpts" showed key_sentences (first long sentences of
-#        the body) while FinBERT scored a SEPARATE focus_text. Reviewers saw text
-#        that wasn't scored, making correct labels look wrong.
-#      - Now the sentiment result carries the actual scored span ('scored_text'
-#        + 'scored_excerpts'), and the report surfaces THAT under a clearly
-#        labelled "Scored text (what FinBERT actually read)" section. The raw
-#        body excerpts are still shown separately for context.
-#
-# Carried over from v3: CB-focused sentiment, 0-100 CB alignment + relevance,
-# drop-ambiguous-chunks aggregation, expanded CB taxonomy, CB mention gate on
-# outcomes, corrupted-content voiding, paywall detection, confidence flagging.
 
 import streamlit as st
 import requests
@@ -124,8 +90,6 @@ PAYWALL_DOMAINS = [
 
 # ------------------------------------------------------------------ #
 # CrossBoundary entity variants (expanded to CB's real brands).
-# Multi-word forms are unambiguous; the short acronyms (cbe, cbea) are kept
-# with strict word boundaries so they only match as standalone tokens.
 # ------------------------------------------------------------------ #
 CB_NAMES = [
     "crossboundary", "cross boundary", "cross-boundary",
@@ -136,9 +100,6 @@ CB_NAMES = [
     "fund for nature",
 ]
 
-# CB sub-brand acronyms that are risky as bare tokens get extra context guarding.
-# We only treat "cbe"/"cbea" as CB when they appear near energy/access/Africa context,
-# to avoid matching unrelated uses. Handled in _cb_sentence_match().
 CB_AMBIGUOUS = {"cbe", "cbea"}
 CB_CONTEXT_TERMS = [
     "energy", "mini-grid", "minigrid", "solar", "africa", "renewable",
@@ -149,45 +110,57 @@ CB_CONTEXT_TERMS = [
 _TITLE_SUFFIX_RE = re.compile(r'\s*[|\u2013\u2014\-]\s*[^|\u2013\u2014\-]{2,40}$')
 
 # ------------------------------------------------------------------ #
+# FINANCE SENTIMENT GUARD (v5)
+# FinBERT was trained on financial news where "debt", "raised debt", etc.
+# skew negative even when the event is a capital-raise win. These cue lists
+# let us detect that pattern at the chunk level and conservatively nudge a
+# false-negative toward neutral. Only fires when capital-raise cues are present
+# AND no genuine-negative cue is present. Kept transparent + toggleable.
+# ------------------------------------------------------------------ #
+FINANCE_POSITIVE_CUES = [
+    "raised", "secured", "closed", "oversubscribed", "record",
+    "largest", "landmark", "milestone", "anchored", "capital raise",
+    "fundraise", "commitment", "committed", "expansion", "scaling",
+    "first", "debt and equity", "debt from", "equity from",
+]
+GENUINE_NEGATIVE_CUES = [
+    "loss", "losses", "default", "defaulted", "lawsuit", "fraud",
+    "write-down", "writedown", "impairment", "layoff", "layoffs",
+    "bankruptcy", "insolvency", "collapse", "plunge", "slump",
+    "downgrade", "missed", "shortfall", "scandal", "probe",
+    "investigation", "halt", "halted", "cancelled", "canceled",
+    "delay", "delayed", "decline", "fell", "drop", "crisis",
+]
+
+# ------------------------------------------------------------------ #
 # Coverage type classification constants
 # ------------------------------------------------------------------ #
-
-# CrossBoundary-owned publishing domains
 CB_OWNED_DOMAINS = [
     "crossboundary.com", "crossboundaryenergy.com",
     "crossboundary.energy", "crossboundaryaccess.com",
 ]
 
-# Paid PR wire / press release distribution services → treated as Owned
 PR_WIRE_DOMAINS = [
     "prnewswire.com", "businesswire.com", "globenewswire.com",
     "accesswire.com", "prweb.com", "einpresswire.com", "newswire.com",
     "presswire.com", "send2press.com",
 ]
 
-# Proactive signal patterns — CB-initiated coverage indicators
-# Checked against lowercase article body text
 PROACTIVE_PATTERNS = [
-    # Formal announcement language
     (r'\b(?:announces|announced|today announced|is pleased to announce)\b',
      "announcement language"),
-    # "About CrossBoundary" company boilerplate — classic press release footer
     (r'\babout crossboundary\b',
      "company boilerplate ('About CrossBoundary') detected"),
-    # Press release headers / footers
     (r'\bfor immediate release\b',
      "press release header detected"),
     (r'\bpress release\b',
      "press release label detected"),
-    # CB executive directly quoted: "said [Name], [title]... CrossBoundary"
-    # or "CrossBoundary's [title] said"
     (r'said\s+\w[\w\s]{2,30},\s*(?:ceo|cfo|coo|founder|co-founder|director|'
      r'head|partner|manager|associate|analyst)\s+(?:of\s+|at\s+)?crossboundary',
      "CB executive quoted"),
     (r'crossboundary(?:\s+energy|\s+advisory|\s+access|\s+group)?'
      r'[\'s]*\s+(?:ceo|cfo|coo|founder|co-founder|director|head|partner)',
      "CB executive title attributed"),
-    # Generic "crossboundary said" / "crossboundary noted"
     (r'crossboundary(?:\s+energy|\s+advisory|\s+access|\s+group)?\s+'
      r'(?:said|noted|stated|confirmed|commented|added)',
      "CB organisation statement"),
@@ -211,10 +184,9 @@ class EnhancedCompanyAnalyzer:
         self.confidence_threshold = 0.55   # below this => "Needs Review"
         self.focus_cb = True               # score sentiment on CB-context sentences
         self.neighbor_window = 2           # sentences to include on each side of a CB hit
+        self.neutral_margin = 0.10         # v5: pos/neg within this of neutral => neutral
+        self.finance_guard = True          # v5: nudge debt/raise false-negatives
 
-        # ------------------------------------------------------------------ #
-        # Positioning pillars — refined to CrossBoundary's own language
-        # ------------------------------------------------------------------ #
         self.positioning_pillars = {
             "frontier_investment": {
                 "keywords": [
@@ -262,12 +234,10 @@ class EnhancedCompanyAnalyzer:
             }
         }
 
-        # Flat keyword set for fast "any pillar keyword?" checks
         self._all_pillar_keywords = [
             kw for cfg in self.positioning_pillars.values() for kw in cfg["keywords"]
         ]
 
-        # Business outcomes with keywords
         self.business_outcomes = {
             "BD Support": {
                 "keywords": ["joint venture", "business development", "alliance"],
@@ -305,19 +275,15 @@ class EnhancedCompanyAnalyzer:
     # ------------------------------------------------------------------ #
     @staticmethod
     def _clean_title(title):
-        """Normalise whitespace, strip a trailing ' | Site Name' suffix, cap length."""
         if not title:
             return None
         title = re.sub(r'\s+', ' ', title).strip()
-        # Strip a single trailing site-name suffix if the remaining title is substantial
         stripped = _TITLE_SUFFIX_RE.sub('', title).strip()
         if len(stripped) >= 15:
             title = stripped
         return title[:120] or None
 
     def extract_title(self, soup):
-        """Extract article title from a BeautifulSoup tree (fallback path).
-        Order: <title> -> og:title -> twitter:title -> <h1>."""
         candidates = []
 
         if soup.title and soup.title.string:
@@ -342,13 +308,6 @@ class EnhancedCompanyAnalyzer:
         return None
 
     def fetch_page_content(self, url):
-        """Fetch a page and extract the clean ARTICLE BODY using trafilatura,
-        falling back to a cleaned BeautifulSoup parse if needed.
-        Includes corrupted-content and paywall detection.
-
-        TITLE FALLBACK (v4): whenever trafilatura does not supply a title, the
-        BeautifulSoup/meta fallback runs regardless of whether body extraction
-        succeeded. The soup tree is built at most once and reused."""
         try:
             if not url.startswith(('http://', 'https://')):
                 url = 'https://' + url
@@ -371,7 +330,7 @@ class EnhancedCompanyAnalyzer:
             title = None
             text = ""
             corrupted = False
-            soup = None  # built lazily, reused across title + body fallback
+            soup = None
 
             extracted = trafilatura.extract(
                 html,
@@ -385,14 +344,10 @@ class EnhancedCompanyAnalyzer:
                 text = (data.get('text') or "").strip()
                 title = self._clean_title(data.get('title'))
 
-            # ---- TITLE FALLBACK (decoupled from body success) ----
-            # Run whenever trafilatura gave us no usable title, independent of
-            # whether the body extracted fine.
             if not title and html:
                 soup = BeautifulSoup(html, 'html.parser')
                 title = self.extract_title(soup)
 
-            # ---- BODY FALLBACK (only when trafilatura body nearly failed) ----
             if len(text) < 50:
                 if soup is None:
                     soup = BeautifulSoup(html, 'html.parser')
@@ -403,7 +358,6 @@ class EnhancedCompanyAnalyzer:
 
             text = re.sub(r'\s+', ' ', text).strip()
 
-            # Detect corrupted/binary content (e.g. garbled PDF extraction)
             if len(text) > 0:
                 non_ascii_ratio = sum(1 for c in text if ord(c) > 127) / len(text)
                 if non_ascii_ratio > 0.25:
@@ -442,7 +396,6 @@ class EnhancedCompanyAnalyzer:
     # ------------------------------------------------------------------ #
     @staticmethod
     def _chunk_text(text, max_chars=1500, max_chunks=6):
-        """Split clean text into sentence-aligned chunks (~<512 tokens each)."""
         sentences = re.split(r'(?<=[.!?])\s+', text)
         chunks, cur = [], ""
         for s in sentences:
@@ -456,8 +409,19 @@ class EnhancedCompanyAnalyzer:
         return (chunks or [text[:max_chars]])[:max_chunks]
 
     @staticmethod
+    def _truncate_words(text, max_chars):
+        """v5: truncate at a word boundary so display excerpts don't cut
+        mid-token (e.g. 'equity fro'). Adds an ellipsis if shortened."""
+        if not text or len(text) <= max_chars:
+            return text
+        cut = text[:max_chars]
+        sp = cut.rfind(' ')
+        if sp > 0:
+            cut = cut[:sp]
+        return cut.rstrip(' ,;:') + '…'
+
+    @staticmethod
     def _match_keywords(text_lower, keywords):
-        """Word-boundary regex match."""
         found = []
         for kw in keywords:
             if re.search(r'\b' + re.escape(kw) + r'\b', text_lower):
@@ -471,8 +435,6 @@ class EnhancedCompanyAnalyzer:
         )
 
     def _cb_sentence_match(self, sentence_lower):
-        """Return True if this sentence references CrossBoundary.
-        Ambiguous acronyms (cbe/cbea) only count when CB-context terms are nearby."""
         for name in CB_NAMES:
             if not re.search(r'\b' + re.escape(name) + r'\b', sentence_lower):
                 continue
@@ -485,14 +447,11 @@ class EnhancedCompanyAnalyzer:
         return False
 
     def _headline_mentions_cb(self, headline):
-        """True if the headline text itself names CrossBoundary (gates headline-first)."""
         if not headline:
             return False
         return self._cb_sentence_match(headline.lower())
 
     def _is_cb_mentioned(self, text):
-        """Check if CrossBoundary is mentioned anywhere in the article body.
-        A single mention — including a quoted CB member statement — counts."""
         sentences = [s.strip() for s in re.split(r'(?<=[.!?])\s+', text) if s.strip()]
         return any(self._cb_sentence_match(s.lower()) for s in sentences)
 
@@ -500,7 +459,6 @@ class EnhancedCompanyAnalyzer:
     # Coverage type classification
     # ------------------------------------------------------------------ #
     def classify_coverage_type(self, url, text, cb_mentioned):
-        """Classify coverage as Owned / Proactive / Earned / Unknown."""
         url_lower = (url or "").lower()
         text_lower = (text or "").lower()
 
@@ -529,16 +487,9 @@ class EnhancedCompanyAnalyzer:
                 'reason': 'CB mentioned in independent third-party coverage'}
 
     # ------------------------------------------------------------------ #
-    # CB-focused sentence selection (drives both CB-tuning and confidence)
+    # CB-focused sentence selection
     # ------------------------------------------------------------------ #
     def _build_focus_text(self, text):
-        """Choose which text to feed FinBERT.
-
-        Returns (focus_text, focus_mode, cb_mentioned, cb_relevance):
-          - 'cb_context'  : sentences mentioning CB (+ neighbors)        [best signal]
-          - 'pillar'      : sentences with pillar keywords               [topic-level]
-          - 'full'        : whole article                                [fallback]
-        """
         sentences = re.split(r'(?<=[.!?])\s+', text)
         sentences = [s.strip() for s in sentences if s.strip()]
         if not sentences:
@@ -585,15 +536,50 @@ class EnhancedCompanyAnalyzer:
         return focus_text, mode, cb_mentioned, cb_relevance
 
     # ------------------------------------------------------------------ #
+    # v5: finance false-negative guard (chunk-level, transparent)
+    # ------------------------------------------------------------------ #
+    def _finance_guard_adjust(self, chunk, dist):
+        """If FinBERT calls a chunk negative purely on capital-raise language
+        (debt/equity raised, secured, record, etc.) with NO genuine-negative
+        cue present, shift part of the negative mass to neutral.
+
+        Returns (adjusted_dist, fired_bool). Conservative: moves at most half
+        of the negative mass, never invents positive sentiment."""
+        if not self.finance_guard:
+            return dist, False
+        if max(dist, key=dist.get) != 'negative':
+            return dist, False
+
+        cl = chunk.lower()
+        has_pos_cue = any(re.search(r'\b' + re.escape(c) + r'\b', cl)
+                          for c in FINANCE_POSITIVE_CUES)
+        has_neg_cue = any(re.search(r'\b' + re.escape(c) + r'\b', cl)
+                          for c in GENUINE_NEGATIVE_CUES)
+
+        if not (has_pos_cue and not has_neg_cue):
+            return dist, False
+
+        adj = dict(dist)
+        shift = adj['negative'] * 0.5
+        adj['negative'] -= shift
+        adj['neutral'] += shift
+        # renormalise defensively
+        total = sum(adj.values()) or 1.0
+        for k in adj:
+            adj[k] /= total
+        return adj, True
+
+    # ------------------------------------------------------------------ #
     # FinBERT aggregation (drop-ambiguous-chunks; neutral fully preserved)
     # ------------------------------------------------------------------ #
     def _aggregate_finbert(self, chunks):
         """Run FinBERT on each chunk and combine into one distribution.
 
-        Returns (agg_distribution, n_decisive, decisive_chunks) where
-        decisive_chunks is the list of chunk strings that actually fed the score
-        (used to show the user exactly what was scored)."""
+        Returns (agg_distribution, n_decisive, decisive_chunks, breakdown,
+        guard_fired) where breakdown is a per-decisive-chunk list of
+        (top_label, top_conf, guard_applied) for diagnostics."""
         per_chunk_data = []
+        guard_fired_any = False
         for ch in chunks:
             out = self.model(ch, truncation=True, max_length=512, top_k=None)
             scores = out[0] if out and isinstance(out[0], list) else out
@@ -602,35 +588,50 @@ class EnhancedCompanyAnalyzer:
                 dist[s['label'].lower()] = float(s['score'])
             for k in ('positive', 'negative', 'neutral'):
                 dist.setdefault(k, 0.0)
+            dist, fired = self._finance_guard_adjust(ch, dist)
+            guard_fired_any = guard_fired_any or fired
             top_conf = max(dist.values())
-            per_chunk_data.append((ch, dist, top_conf))
+            per_chunk_data.append((ch, dist, top_conf, fired))
 
-        decisive = [(ch, d) for ch, d, conf in per_chunk_data if conf >= 0.50]
+        decisive = [(ch, d, fired) for ch, d, conf, fired in per_chunk_data if conf >= 0.50]
         if not decisive:
             best = max(per_chunk_data, key=lambda x: x[2])
-            decisive = [(best[0], best[1])]
+            decisive = [(best[0], best[1], best[3])]
 
         agg = {'positive': 0.0, 'negative': 0.0, 'neutral': 0.0}
         total_w = 0.0
-        for ch, dist in decisive:
+        breakdown = []
+        for ch, dist, fired in decisive:
             w = float(len(ch)) + 1e-6
             total_w += w
             for k in agg:
                 agg[k] += dist[k] * w
+            top_lbl = max(dist, key=dist.get)
+            breakdown.append((top_lbl, dist[top_lbl], fired))
         for k in agg:
             agg[k] /= total_w
 
-        decisive_chunks = [ch for ch, _ in decisive]
-        return agg, len(decisive), decisive_chunks
+        decisive_chunks = [ch for ch, _, _ in decisive]
+        return agg, len(decisive), decisive_chunks, breakdown, guard_fired_any
+
+    def _disambiguate(self, agg):
+        """v5: resolve the final label from a distribution.
+
+        If the raw winner is positive/negative but sits within neutral_margin
+        of the neutral score, treat it as neutral — a near-tie on financial
+        text shouldn't surface as a directional sentiment. Returns
+        (label, confidence, downgraded_bool)."""
+        raw_label = max(agg, key=agg.get)
+        if raw_label != 'neutral':
+            if (agg[raw_label] - agg['neutral']) < self.neutral_margin:
+                return 'neutral', agg['neutral'], True
+        return raw_label, agg[raw_label], False
 
     @staticmethod
     def _excerpts_from(scored_text, max_excerpts=3):
-        """Pull a few representative sentences from the actually-scored text,
-        for display so reviewers see what FinBERT read."""
         if not scored_text:
             return []
         sents = [s.strip() for s in re.split(r'(?<=[.!?])\s+', scored_text) if s.strip()]
-        # Prefer substantive sentences; fall back to whatever exists
         substantive = [s for s in sents if len(s) > 40] or sents
         return substantive[:max_excerpts]
 
@@ -640,18 +641,6 @@ class EnhancedCompanyAnalyzer:
     _SKIP_TITLES = {"untitled article", "untitled", ""}
 
     def analyze_sentiment_with_explanation(self, text, title=""):
-        """3-class sentiment via FinBERT.
-
-        Stage 1: headline-first — NOW CB-GATED. Only used when the headline is a
-        real title, is confident (>= threshold), AND the headline itself names
-        CrossBoundary. This keeps a CB-specific tool from logging a generic
-        topic-headline sentiment as if it were CB sentiment.
-
-        Stage 2: CB-focused text (or full-article fallback).
-
-        The returned dict always includes 'scored_text' and 'scored_excerpts'
-        describing exactly what FinBERT read, so the report can display it.
-        """
         focus_text, focus_mode, cb_mentioned, cb_relevance = self._build_focus_text(text)
 
         # ---- Stage 1: headline-first (CB-gated) ----
@@ -662,10 +651,10 @@ class EnhancedCompanyAnalyzer:
             and not headline.lower().startswith("error:")
         )
         if headline_is_real and self._headline_mentions_cb(headline):
-            title_agg, _, _ = self._aggregate_finbert([headline])
-            title_label = max(title_agg, key=title_agg.get)
-            title_conf = title_agg[title_label]
+            title_agg, _, _, _, _ = self._aggregate_finbert([headline])
+            title_label, title_conf, title_downgraded = self._disambiguate(title_agg)
             if title_conf >= self.confidence_threshold:
+                dg_note = (" Near-tie with neutral — reported as NEUTRAL." if title_downgraded else "")
                 return {
                     'label': title_label,
                     'score': title_conf,
@@ -676,7 +665,7 @@ class EnhancedCompanyAnalyzer:
                         f"which directly names CrossBoundary. "
                         f"Distribution — positive {title_agg['positive']:.0%}, "
                         f"neutral {title_agg['neutral']:.0%}, "
-                        f"negative {title_agg['negative']:.0%}."
+                        f"negative {title_agg['negative']:.0%}.{dg_note}"
                     ),
                     'focus_mode': 'headline',
                     'cb_mentioned': cb_mentioned,
@@ -684,6 +673,8 @@ class EnhancedCompanyAnalyzer:
                     'distribution': title_agg,
                     'scored_text': headline,
                     'scored_excerpts': [headline],
+                    'chunk_breakdown': [],
+                    'finance_guard_fired': False,
                     'key_phrases': []
                 }
 
@@ -700,14 +691,15 @@ class EnhancedCompanyAnalyzer:
                 'distribution': {'positive': 0.0, 'negative': 0.0, 'neutral': 1.0},
                 'scored_text': '',
                 'scored_excerpts': [],
+                'chunk_breakdown': [],
+                'finance_guard_fired': False,
                 'key_phrases': []
             }
 
         chunks = self._chunk_text(focus_text)
-        agg, n, decisive_chunks = self._aggregate_finbert(chunks)
+        agg, n, decisive_chunks, breakdown, guard_fired = self._aggregate_finbert(chunks)
 
-        sentiment = max(agg, key=agg.get)
-        confidence = agg[sentiment]
+        sentiment, confidence, downgraded = self._disambiguate(agg)
         needs_review = confidence < self.confidence_threshold
 
         scored_text = " ".join(decisive_chunks)
@@ -724,6 +716,21 @@ class EnhancedCompanyAnalyzer:
             f"recommend manual review before logging."
             if needs_review else ""
         )
+        downgrade_note = ""
+        if downgraded:
+            raw_label = max(agg, key=agg.get)
+            downgrade_note = (
+                f" Note: raw top class was {raw_label.upper()} ({agg[raw_label]:.0%}) but it "
+                f"fell within {self.neutral_margin:.0%} of NEUTRAL ({agg['neutral']:.0%}), "
+                f"so it was reported as NEUTRAL (near-tie)."
+            )
+        guard_note = ""
+        if guard_fired:
+            guard_note = (
+                " Finance guard applied: at least one chunk read NEGATIVE on capital-raise "
+                "language (e.g. 'raised … in debt') with no genuine-negative cue, so part of "
+                "that negative mass was shifted to neutral."
+            )
 
         explanation = (
             f"FinBERT classified this as {sentiment.upper()} "
@@ -731,7 +738,7 @@ class EnhancedCompanyAnalyzer:
             f"across {n} decisive chunk(s). "
             f"Class distribution — positive {agg['positive']:.0%}, "
             f"neutral {agg['neutral']:.0%}, negative {agg['negative']:.0%}."
-            f"{review_note}"
+            f"{downgrade_note}{guard_note}{review_note}"
         )
 
         return {
@@ -745,6 +752,8 @@ class EnhancedCompanyAnalyzer:
             'distribution': agg,
             'scored_text': scored_text,
             'scored_excerpts': scored_excerpts,
+            'chunk_breakdown': breakdown,
+            'finance_guard_fired': guard_fired,
             'key_phrases': []
         }
 
@@ -854,7 +863,8 @@ class EnhancedCompanyAnalyzer:
                 'error': True, 'paywall': True, 'corrupted': False,
                 'sentiment': {'label': 'neutral', 'score': 0.0, 'needs_review': True,
                               'cb_mentioned': False, 'cb_relevance': 0, 'focus_mode': 'full',
-                              'scored_text': '', 'scored_excerpts': [],
+                              'scored_text': '', 'scored_excerpts': [], 'chunk_breakdown': [],
+                              'finance_guard_fired': False,
                               'explanation': 'Paywalled article — manual entry required'},
                 'alignment': {'status': 'NO', 'score': 0,
                               'explanation': 'Paywalled — content unavailable', 'matches': []},
@@ -876,7 +886,8 @@ class EnhancedCompanyAnalyzer:
                 'error': True, 'paywall': False, 'corrupted': page_data.get('corrupted', False),
                 'sentiment': {'label': 'neutral', 'score': 0.0, 'needs_review': True,
                               'cb_mentioned': False, 'cb_relevance': 0, 'focus_mode': 'full',
-                              'scored_text': '', 'scored_excerpts': [],
+                              'scored_text': '', 'scored_excerpts': [], 'chunk_breakdown': [],
+                              'finance_guard_fired': False,
                               'explanation': explanation},
                 'alignment': {'status': 'NO', 'score': 0, 'explanation': explanation, 'matches': []},
                 'outcomes': {'outcomes': [], 'cb_mentioned': False, 'explanation': explanation},
@@ -945,9 +956,9 @@ def create_html_report(results):
     <body>
         <h1>🏢 Company Image Sentiment Analysis Report</h1>
         <p><strong>Generated:</strong> {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}</p>
-        <p><em>v4 — title fallback, CB-gated headline-first, scored-text excerpt display,
-        CB-focused text, expanded CrossBoundary taxonomy, CB mention gate,
-        corrupted-content voiding, paywall detection.</em></p>
+        <p><em>v5 — near-tie neutral disambiguation, finance false-negative guard,
+        per-chunk diagnostics, word-boundary excerpt truncation; on top of v4
+        title fallback, CB-gated headline-first, scored-text display, CB-focused text.</em></p>
 
         <div class="summary">
             <h2>Executive Summary</h2>
@@ -1050,7 +1061,7 @@ def create_html_report(results):
             </div>
         """
 
-        # ---- Scored text: exactly what FinBERT read (v4) ----
+        # ---- Scored text: exactly what FinBERT read ----
         scored_excerpts = result['sentiment'].get('scored_excerpts', [])
         if scored_excerpts:
             html_content += f"""
@@ -1060,8 +1071,18 @@ def create_html_report(results):
                 <ul>
             """
             for s in scored_excerpts:
-                html_content += f"<li>\"{s[:240]}\"</li>"
+                html_content += f"<li>\"{EnhancedCompanyAnalyzer._truncate_words(s, 240)}\"</li>"
             html_content += "</ul></div>"
+
+        # ---- Per-chunk diagnostic (v5) ----
+        breakdown = result['sentiment'].get('chunk_breakdown', [])
+        if breakdown:
+            html_content += "<p style='font-size:0.85em;color:#555;'><strong>Per-chunk read:</strong> "
+            html_content += " · ".join(
+                f"chunk {i}: {lbl.upper()} {conf:.0%}{' (guard)' if fired else ''}"
+                for i, (lbl, conf, fired) in enumerate(breakdown, 1)
+            )
+            html_content += "</p>"
 
         html_content += f"""
             <h4>🎯 Positioning Alignment</h4>
@@ -1086,15 +1107,15 @@ def create_html_report(results):
             <ul>
             """
             for sentence in result['key_sentences'][:3]:
-                html_content += f"<li>\"{sentence[:200]}...\"</li>"
+                html_content += f"<li>\"{EnhancedCompanyAnalyzer._truncate_words(sentence, 200)}\"</li>"
             html_content += "</ul>"
 
         html_content += "</div>"
 
     html_content += """
         <div class="footer">
-            <p>Report generated by Company Image Sentiment Analyzer v4</p>
-            <p>Title fallback · CB-gated headline-first · scored-text display · CB-focused text · expanded CB taxonomy · CB mention gate · corrupted-content voiding · paywall detection</p>
+            <p>Report generated by Company Image Sentiment Analyzer v5</p>
+            <p>Near-tie neutral disambiguation · finance false-negative guard · per-chunk diagnostics · word-boundary excerpts · CB-gated headline-first · scored-text display · CB-focused text · CB mention gate · corrupted-content voiding · paywall detection</p>
         </div>
     </body>
     </html>
@@ -1133,6 +1154,21 @@ def main():
             help="When CB is mentioned, score sentiment on the sentences about CB (plus "
                  "neighbors) rather than the whole page. Makes the score CB-specific."
         )
+        neutral_margin = st.slider(
+            "Near-tie → neutral margin",
+            min_value=0.00, max_value=0.20, value=0.10, step=0.01,
+            help="If POSITIVE or NEGATIVE wins but is within this margin of the NEUTRAL "
+                 "score, the result is reported as NEUTRAL. Stops FinBERT near-ties on "
+                 "dry financial text from surfacing as directional sentiment. Set to 0 to disable."
+        )
+        finance_guard = st.toggle(
+            "Finance false-negative guard",
+            value=True,
+            help="Nudges a chunk that FinBERT reads NEGATIVE purely on capital-raise "
+                 "language ('raised … in debt', 'secured', 'record') toward neutral, "
+                 "but ONLY when no genuine-negative word (loss, default, lawsuit…) is present. "
+                 "Lexical override — monitor against your labeled set."
+        )
 
         max_workers = st.slider("Parallel workers", 1, 3, 1)
         st.caption("Keep at 1 on Streamlit Community Cloud (1 GB RAM) to avoid out-of-memory crashes.")
@@ -1145,9 +1181,11 @@ def main():
             "no longer override CB sentiment.\n\n"
             "**Drop ambiguous chunks:** chunks where no class reaches 50% are excluded "
             "from averaging — they add noise, not signal. Neutral can still win.\n\n"
+            "**Near-tie → neutral:** a barely-negative-over-neutral split is reported "
+            "as neutral, not negative.\n\n"
+            "**Finance guard:** capital-raise language no longer drags a chunk negative.\n\n"
             "**CB focus:** sentiment reflects how the article feels about CrossBoundary.\n\n"
-            "**Scored text shown:** the report displays the exact text FinBERT read.\n\n"
-            "**CB relevance score:** 0–100 estimate of how much the article is about CB."
+            "**Scored text shown:** the report displays the exact text FinBERT read."
         )
 
         st.markdown("---")
@@ -1155,6 +1193,7 @@ def main():
         st.info(
             "- Expand any result for the full explanation\n"
             "- Check '🔬 Scored Text' to see exactly what FinBERT read\n"
+            "- Check the per-chunk read to see which chunk drove the score\n"
             "- Download CSV and filter 'Needs Review = TRUE' first\n"
             "- Lower the threshold if too many true-positive CB articles get flagged"
         )
@@ -1162,6 +1201,8 @@ def main():
     analyzer = st.session_state.analyzer
     analyzer.confidence_threshold = confidence_threshold
     analyzer.focus_cb = focus_cb
+    analyzer.neutral_margin = neutral_margin
+    analyzer.finance_guard = finance_guard
 
     st.markdown("### 📝 Enter URLs to Analyze")
 
@@ -1222,6 +1263,7 @@ def main():
                 'Confidence': f"{r['sentiment']['score']:.1%}" if not r.get('error') else 'N/A',
                 'Needs Review': r['sentiment'].get('needs_review', True) if not r.get('error') else True,
                 'Focus Mode': r['sentiment'].get('focus_mode', 'full') if not r.get('error') else 'N/A',
+                'Finance Guard': r['sentiment'].get('finance_guard_fired', False) if not r.get('error') else False,
                 'Scored Text': r['sentiment'].get('scored_text', '')[:500] if not r.get('error') else '',
                 'CB Relevance': r['sentiment'].get('cb_relevance', 0) if not r.get('error') else 0,
                 'Alignment': r['alignment']['status'] if not r.get('error') else 'N/A',
@@ -1395,7 +1437,7 @@ def display_detailed_results(results):
             </div>
             """, unsafe_allow_html=True)
 
-            # ---- Scored text: exactly what FinBERT read (v4) ----
+            # ---- Scored text: exactly what FinBERT read ----
             scored_excerpts = result['sentiment'].get('scored_excerpts', [])
             focus_label = {
                 'cb_context': "CrossBoundary-specific sentences",
@@ -1407,9 +1449,18 @@ def display_detailed_results(results):
                 st.markdown(f"#### 🔬 Scored Text — what FinBERT actually read ({focus_label})")
                 for i, s in enumerate(scored_excerpts, 1):
                     st.markdown(
-                        f"<div class='scored-box'><strong>{i}.</strong> \"{s[:280]}\"</div>",
+                        f"<div class='scored-box'><strong>{i}.</strong> \"{EnhancedCompanyAnalyzer._truncate_words(s, 280)}\"</div>",
                         unsafe_allow_html=True
                     )
+
+            # ---- Per-chunk diagnostic (v5) ----
+            breakdown = result['sentiment'].get('chunk_breakdown', [])
+            if breakdown:
+                chunk_str = " · ".join(
+                    f"chunk {i}: **{lbl.upper()}** {conf:.0%}{' _(guard)_' if fired else ''}"
+                    for i, (lbl, conf, fired) in enumerate(breakdown, 1)
+                )
+                st.caption(f"Per-chunk read → {chunk_str}")
 
             st.markdown("#### 🎯 Positioning Alignment")
             alignment_color = {'YES': 'green', 'PARTIAL': 'orange', 'NO': 'red'}.get(
@@ -1450,7 +1501,7 @@ def display_detailed_results(results):
                 st.markdown("#### 📝 Article Body Excerpts (context only — not necessarily the scored text)")
                 for i, sentence in enumerate(result['key_sentences'][:3], 1):
                     st.markdown(
-                        f"<div class='explanation-box'><strong>{i}.</strong> \"{sentence[:250]}...\"</div>",
+                        f"<div class='explanation-box'><strong>{i}.</strong> \"{EnhancedCompanyAnalyzer._truncate_words(sentence, 250)}\"</div>",
                         unsafe_allow_html=True
                     )
 
