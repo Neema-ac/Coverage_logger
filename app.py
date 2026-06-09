@@ -387,6 +387,12 @@ class EnhancedCompanyAnalyzer:
             return True
         return False
 
+    def _is_cb_mentioned(self, text):
+        """Check if CrossBoundary is mentioned anywhere in the article body.
+        A single mention — including a quoted CB member statement — counts."""
+        sentences = [s.strip() for s in re.split(r'(?<=[.!?])\s+', text) if s.strip()]
+        return any(self._cb_sentence_match(s.lower()) for s in sentences)
+
     # ------------------------------------------------------------------ #
     # CB-focused sentence selection (drives both CB-tuning and confidence)
     # ------------------------------------------------------------------ #
@@ -407,7 +413,7 @@ class EnhancedCompanyAnalyzer:
         cb_idx = [i for i, s in enumerate(lowered) if self._cb_sentence_match(s)]
         pillar_idx = [i for i, s in enumerate(lowered) if self._any_pillar_keyword(s)]
 
-        cb_mentioned = len(cb_idx) > 0
+        cb_mentioned = len(cb_idx) >= 1
 
         # CB relevance: how much of the article is actually about CB / its pillars (0-100)
         if cb_mentioned:
@@ -493,26 +499,42 @@ class EnhancedCompanyAnalyzer:
     # ------------------------------------------------------------------ #
     # Sentiment (CB-focused + threshold from settings)
     # ------------------------------------------------------------------ #
-    def analyze_sentiment_with_explanation(self, text, title=""):
-        """3-class sentiment via FinBERT, scored on CB-focused text where possible.
-        Results below the configured threshold are flagged needs_review.
+    # Titles that are extraction fallbacks — never use these as the sentiment source
+    _SKIP_TITLES = {"untitled article", "untitled", ""}
 
-        Stage 1: try the article headline — FinBERT is trained on headlines and very
-        decisive on them. If the title alone crosses the threshold, use it.
-        Stage 2: score on CB-context sentences (or full article as fallback).
+    def analyze_sentiment_with_explanation(self, text, title=""):
+        """3-class sentiment via FinBERT.
+
+        CB metadata (cb_mentioned, cb_relevance) is always computed from the
+        article body first, so alignment and outcome gating are never zeroed out.
+
+        Stage 1: headline-first — if the article has a real title and FinBERT
+        is confident on it (>= threshold), use that result. Skipped for generic
+        fallback titles ('Untitled Article', etc.) that are extraction artefacts.
+
+        Stage 2: CB-focused text (or full article fallback).
         """
-        # ---- Stage 1: headline-first ----
+        # Always run focus-text analysis first (cheap — no model call).
+        # This ensures cb_mentioned / cb_relevance are real values regardless
+        # of which scoring stage is used below.
+        focus_text, focus_mode, cb_mentioned, cb_relevance = self._build_focus_text(text)
+
+        # ---- Stage 1: headline-first (only for real, substantive titles) ----
         headline = (title or "").strip()
-        if len(headline) > 15:
+        headline_is_real = (
+            len(headline) > 15
+            and headline.lower() not in self._SKIP_TITLES
+            and not headline.lower().startswith("error:")
+        )
+        if headline_is_real:
             title_agg, _ = self._aggregate_finbert([headline])
             title_label = max(title_agg, key=title_agg.get)
             title_conf = title_agg[title_label]
             if title_conf >= self.confidence_threshold:
-                needs_review = False
                 return {
                     'label': title_label,
                     'score': title_conf,
-                    'needs_review': needs_review,
+                    'needs_review': False,
                     'explanation': (
                         f"FinBERT classified as {title_label.upper()} "
                         f"(confidence {title_conf:.1%}) from the article headline. "
@@ -521,15 +543,13 @@ class EnhancedCompanyAnalyzer:
                         f"negative {title_agg['negative']:.0%}."
                     ),
                     'focus_mode': 'headline',
-                    'cb_mentioned': False,
-                    'cb_relevance': 0,
+                    'cb_mentioned': cb_mentioned,
+                    'cb_relevance': cb_relevance,
                     'distribution': title_agg,
                     'key_phrases': []
                 }
 
-        # ---- Stage 2: CB-focused text ----
-        focus_text, focus_mode, cb_mentioned, cb_relevance = self._build_focus_text(text)
-
+        # ---- Stage 2: CB-focused text (headline skipped or not confident enough) ----
         if not focus_text or len(focus_text.strip()) < 50:
             return {
                 'label': 'neutral',
@@ -654,7 +674,7 @@ class EnhancedCompanyAnalyzer:
     def determine_outcomes_with_explanation(self, text, sentiment, matched_pillars):
         """Determine business outcomes; only tag when CrossBoundary is mentioned."""
         text_lower = text.lower()
-        cb_mentioned = self._cb_sentence_match(text_lower)
+        cb_mentioned = self._is_cb_mentioned(text)
 
         if not cb_mentioned:
             return {
