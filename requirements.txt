@@ -8,3 +8,4 @@ plotly>=5.17.0
 typing-extensions>=4.0.0
 fpdf
 trafilatura
+xhtml2pdf
