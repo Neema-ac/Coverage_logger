@@ -29,6 +29,15 @@ try:
 except ImportError:
     PDF_AVAILABLE = False
 
+# HTML -> PDF conversion (pure-Python, works on Streamlit Community Cloud).
+# Add `xhtml2pdf` to requirements.txt to enable the "Download PDF" button.
+try:
+    from io import BytesIO
+    from xhtml2pdf import pisa
+    XHTML2PDF_AVAILABLE = True
+except ImportError:
+    XHTML2PDF_AVAILABLE = False
+
 st.set_page_config(page_title="Company Sentiment Analyzer", layout="wide")
 
 # Custom CSS
@@ -1136,6 +1145,44 @@ def create_html_report(results):
 
 
 # ------------------------------------------------------------------ #
+# PDF Report (HTML -> PDF via xhtml2pdf)
+# ------------------------------------------------------------------ #
+_EMOJI_RE = re.compile(
+    "["
+    "\U0001F300-\U0001FAFF"   # pictographs / emoji
+    "\U00002600-\U000027BF"   # misc symbols + dingbats (checkmarks, warning, etc.)
+    "\U00002B00-\U00002BFF"   # misc symbols & arrows
+    "\U0000FE00-\U0000FE0F"   # emoji variation selectors
+    "]+",
+    flags=re.UNICODE
+)
+
+
+def create_pdf_report(results):
+    """Render the HTML report to PDF bytes using xhtml2pdf.
+
+    Reuses create_html_report() so the PDF matches the HTML report one-for-one.
+    Emojis are stripped first because xhtml2pdf ships no emoji font and would
+    otherwise draw empty boxes. Returns PDF bytes, or None if the library is
+    missing or conversion fails (the caller falls back to the HTML report).
+    """
+    if not XHTML2PDF_AVAILABLE:
+        return None
+
+    html = create_html_report(results)
+    html = _EMOJI_RE.sub("", html)
+
+    buffer = BytesIO()
+    try:
+        status = pisa.CreatePDF(src=html, dest=buffer, encoding="utf-8")
+    except Exception:
+        return None
+    if status.err:
+        return None
+    return buffer.getvalue()
+
+
+# ------------------------------------------------------------------ #
 # Streamlit UI
 # ------------------------------------------------------------------ #
 def main():
@@ -1263,7 +1310,7 @@ def main():
         st.markdown("---")
         st.markdown("### 📄 Export Results")
 
-        col1, col2, col3 = st.columns(3)
+        col1, col2, col3, col4 = st.columns(4)
 
         with col1:
             df = pd.DataFrame([{
@@ -1315,7 +1362,30 @@ def main():
                 mime="text/html",
                 use_container_width=True
             )
-            st.caption("💡 Open the HTML in any browser, then Print → Save as PDF")
+            st.caption("💡 Or open the HTML and Print → Save as PDF")
+
+        with col4:
+            if XHTML2PDF_AVAILABLE:
+                pdf_bytes = create_pdf_report(results)
+                if pdf_bytes:
+                    st.download_button(
+                        label="📥 Download PDF",
+                        data=pdf_bytes,
+                        file_name=f"sentiment_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf",
+                        mime="application/pdf",
+                        use_container_width=True
+                    )
+                else:
+                    st.button(
+                        "📥 Download PDF", disabled=True, use_container_width=True,
+                        help="PDF conversion failed for this batch — use the HTML report instead."
+                    )
+            else:
+                st.button(
+                    "📥 Download PDF", disabled=True, use_container_width=True,
+                    help="Add `xhtml2pdf` to requirements.txt to enable direct PDF export."
+                )
+            st.caption("📄 Native PDF (emojis omitted for clean print)")
 
     elif analyze_btn and not urls:
         st.warning("⚠️ Please enter at least one URL to analyze")
