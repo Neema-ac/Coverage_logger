@@ -29,14 +29,14 @@ try:
 except ImportError:
     PDF_AVAILABLE = False
 
-# HTML -> PDF conversion (pure-Python, works on Streamlit Community Cloud).
-# Add `xhtml2pdf` to requirements.txt to enable the "Download PDF" button.
+# PDF export via fpdf2 — pure-Python, NO system dependencies (no Cairo /
+# pyHanko build chain), so it installs cleanly on Streamlit Community Cloud.
+# Add `fpdf2` to requirements.txt to enable the "Download PDF" button.
 try:
-    from io import BytesIO
-    from xhtml2pdf import pisa
-    XHTML2PDF_AVAILABLE = True
+    from fpdf import FPDF
+    FPDF_AVAILABLE = True
 except ImportError:
-    XHTML2PDF_AVAILABLE = False
+    FPDF_AVAILABLE = False
 
 st.set_page_config(page_title="Company Sentiment Analyzer", layout="wide")
 
@@ -1145,41 +1145,172 @@ def create_html_report(results):
 
 
 # ------------------------------------------------------------------ #
-# PDF Report (HTML -> PDF via xhtml2pdf)
+# PDF Report (built directly with fpdf2 — no system deps)
 # ------------------------------------------------------------------ #
-_EMOJI_RE = re.compile(
-    "["
-    "\U0001F300-\U0001FAFF"   # pictographs / emoji
-    "\U00002600-\U000027BF"   # misc symbols + dingbats (checkmarks, warning, etc.)
-    "\U00002B00-\U00002BFF"   # misc symbols & arrows
-    "\U0000FE00-\U0000FE0F"   # emoji variation selectors
-    "]+",
-    flags=re.UNICODE
-)
+# fpdf2's core fonts (Helvetica) only cover Latin-1, so we sanitize text:
+# replace common smart punctuation and drop emoji / other non-Latin-1 glyphs.
+_PDF_PUNCT = {
+    "\u2013": "-", "\u2014": "-", "\u2018": "'", "\u2019": "'",
+    "\u201c": '"', "\u201d": '"', "\u2026": "...", "\u2022": "-",
+    "\u00a0": " ", "\u2192": "->", "\u00b7": "-", "\u2122": "(TM)",
+}
+
+# Sentiment / alignment label colors (R, G, B) matching the HTML report.
+_PDF_COLORS = {
+    "positive": (39, 174, 96), "negative": (231, 76, 60),
+    "neutral": (243, 156, 18),
+    "YES": (39, 174, 96), "PARTIAL": (243, 156, 18), "NO": (231, 76, 60),
+}
+
+
+def _pdf_safe(text):
+    """Make a string safe for fpdf2 core fonts (Latin-1 only)."""
+    if text is None:
+        return ""
+    text = str(text)
+    for bad, good in _PDF_PUNCT.items():
+        text = text.replace(bad, good)
+    # Drop anything Latin-1 can't represent (emoji, CJK, etc.).
+    return text.encode("latin-1", "ignore").decode("latin-1")
 
 
 def create_pdf_report(results):
-    """Render the HTML report to PDF bytes using xhtml2pdf.
+    """Build a clean PDF report directly with fpdf2.
 
-    Reuses create_html_report() so the PDF matches the HTML report one-for-one.
-    Emojis are stripped first because xhtml2pdf ships no emoji font and would
-    otherwise draw empty boxes. Returns PDF bytes, or None if the library is
-    missing or conversion fails (the caller falls back to the HTML report).
+    Carries the same content as the HTML report (summary stats, per-article
+    sentiment, alignment, outcomes, color-coded labels). Returns PDF bytes,
+    or None if fpdf2 is missing / generation fails (caller falls back to HTML).
     """
-    if not XHTML2PDF_AVAILABLE:
+    if not FPDF_AVAILABLE:
         return None
 
-    html = create_html_report(results)
-    html = _EMOJI_RE.sub("", html)
-
-    buffer = BytesIO()
     try:
-        status = pisa.CreatePDF(src=html, dest=buffer, encoding="utf-8")
+        pdf = FPDF(format="letter")
+        pdf.set_auto_page_break(auto=True, margin=15)
+        pdf.set_title("Sentiment Analysis Report")
+        pdf.add_page()
+
+        def line(text, size=10, style="", color=(34, 34, 34), height=5):
+            pdf.set_font("Helvetica", style, size)
+            pdf.set_text_color(*color)
+            pdf.multi_cell(0, height, _pdf_safe(text))
+
+        def label_line(prefix, value, value_color=(34, 34, 34), size=10):
+            """A bold label followed by a colored value, on one wrapped block."""
+            pdf.set_font("Helvetica", "B", size)
+            pdf.set_text_color(34, 34, 34)
+            pdf.write(5, _pdf_safe(prefix + " "))
+            pdf.set_font("Helvetica", "", size)
+            pdf.set_text_color(*value_color)
+            pdf.write(5, _pdf_safe(value))
+            pdf.ln(6)
+
+        # ---- Header ----
+        line("Company Image Sentiment Analysis Report", size=16, style="B",
+             color=(102, 126, 234), height=8)
+        line("Generated: " + datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+             size=9, color=(90, 90, 90))
+        pdf.ln(2)
+
+        # ---- Executive summary ----
+        successful = [r for r in results if not r.get('error', False)]
+        needs_review = [r for r in successful if r['sentiment'].get('needs_review', False)]
+        paywalled = [r for r in results if r.get('paywall', False)]
+        corrupted = [r for r in results if r.get('corrupted', False)]
+        failed = [r for r in results if r.get('status') == 'Failed']
+        cb_articles = [r for r in successful if r['outcomes'].get('cb_mentioned', False)]
+
+        line("Executive Summary", size=13, style="B", color=(118, 75, 162), height=7)
+        line(f"Total articles: {len(results)}    "
+             f"Successfully analyzed: {len(successful)}", size=10)
+        line(f"Needs manual review: {len(needs_review)}    "
+             f"Paywalled: {len(paywalled)}    "
+             f"Corrupted/Failed: {len(corrupted) + len(failed)}", size=10)
+        line(f"CB-mentioned articles: {len(cb_articles)}", size=10)
+
+        if successful:
+            pos = sum(1 for r in successful if r['sentiment']['label'] == 'positive')
+            neg = sum(1 for r in successful if r['sentiment']['label'] == 'negative')
+            neu = sum(1 for r in successful if r['sentiment']['label'] == 'neutral')
+            aligned = sum(1 for r in successful if r['alignment']['status'] == 'YES')
+            owned = sum(1 for r in results if r.get('coverage', {}).get('type') == 'Owned')
+            proactive = sum(1 for r in results if r.get('coverage', {}).get('type') == 'Proactive')
+            earned = sum(1 for r in results if r.get('coverage', {}).get('type') == 'Earned')
+            line(f"Sentiment - Positive: {pos}   Negative: {neg}   Neutral: {neu}", size=10)
+            line(f"Strong alignment: {aligned}", size=10)
+            line(f"Coverage - Owned: {owned}   Proactive: {proactive}   Earned: {earned}", size=10)
+        pdf.ln(3)
+
+        # ---- Per-article detail ----
+        for idx, result in enumerate(results, 1):
+            title = result.get('title', 'Untitled')
+
+            # Article heading
+            line(f"{idx}. {title}", size=11, style="B", color=(51, 51, 51), height=6)
+            line("URL: " + result.get('url', ''), size=8, color=(90, 90, 110))
+
+            if result.get('paywall'):
+                line("PAYWALL - manual entry required after reading the article directly.",
+                     size=9, color=(231, 76, 60))
+                pdf.ln(3)
+                continue
+
+            if result.get('error', False):
+                status_label = "CORRUPTED" if result.get('corrupted') else "FAILED"
+                line(f"Status: {status_label}", size=9, color=(231, 76, 60))
+                line(result['sentiment'].get('explanation', ''), size=9, color=(90, 90, 90))
+                pdf.ln(3)
+                continue
+
+            coverage = result.get('coverage', {'type': 'Unknown', 'reason': ''})
+            label_line("Coverage type:", coverage.get('type', 'Unknown').upper(), size=9)
+            line("  " + coverage.get('reason', ''), size=8, color=(90, 90, 90))
+
+            sent = result['sentiment']
+            sent_color = _PDF_COLORS.get(sent['label'], (34, 34, 34))
+            label_line("Sentiment:",
+                       f"{sent['label'].upper()}  (confidence {sent['score']:.1%})"
+                       + ("  [NEEDS REVIEW]" if sent.get('needs_review') else ""),
+                       value_color=sent_color, size=10)
+            line("Explanation: " + sent.get('explanation', ''), size=8, color=(70, 70, 70))
+
+            # Scored excerpts
+            scored = sent.get('scored_excerpts', [])
+            if scored:
+                line("Scored text (what FinBERT read):", size=9, style="B", color=(59, 111, 224))
+                for s in scored:
+                    line("  - " + EnhancedCompanyAnalyzer._truncate_words(s, 240),
+                         size=8, color=(60, 60, 60))
+
+            align = result['alignment']
+            align_color = _PDF_COLORS.get(align['status'], (34, 34, 34))
+            label_line("Positioning alignment:",
+                       f"{align['status']}  (score {align.get('score', 0)}/100  |  "
+                       f"CB relevance {sent.get('cb_relevance', 0)}/100)",
+                       value_color=align_color, size=10)
+            line("Explanation: " + align.get('explanation', ''), size=8, color=(70, 70, 70))
+
+            outc = result['outcomes']
+            cb_flag = outc.get('cb_mentioned', False)
+            label_line("CB mentioned:", "Yes" if cb_flag else "No - outcomes not tagged",
+                       value_color=(39, 174, 96) if cb_flag else (149, 165, 166), size=9)
+            names = ', '.join(o['outcome'] for o in outc['outcomes']) if outc['outcomes'] else 'None'
+            line("Business outcomes: " + names, size=9, color=(70, 70, 70))
+
+            pdf.ln(2)
+            pdf.set_draw_color(220, 220, 220)
+            pdf.line(pdf.l_margin, pdf.get_y(), pdf.w - pdf.r_margin, pdf.get_y())
+            pdf.ln(3)
+
+        # ---- Footer note ----
+        pdf.ln(2)
+        line("Report generated by Company Image Sentiment Analyzer v5", size=8, color=(120, 120, 120))
+
+        out = pdf.output()  # fpdf2 >= 2.x returns a bytearray
+        return bytes(out)
+
     except Exception:
         return None
-    if status.err:
-        return None
-    return buffer.getvalue()
 
 
 # ------------------------------------------------------------------ #
@@ -1365,7 +1496,7 @@ def main():
             st.caption("💡 Or open the HTML and Print → Save as PDF")
 
         with col4:
-            if XHTML2PDF_AVAILABLE:
+            if FPDF_AVAILABLE:
                 pdf_bytes = create_pdf_report(results)
                 if pdf_bytes:
                     st.download_button(
@@ -1378,12 +1509,12 @@ def main():
                 else:
                     st.button(
                         "📥 Download PDF", disabled=True, use_container_width=True,
-                        help="PDF conversion failed for this batch — use the HTML report instead."
+                        help="PDF generation failed for this batch — use the HTML report instead."
                     )
             else:
                 st.button(
                     "📥 Download PDF", disabled=True, use_container_width=True,
-                    help="Add `xhtml2pdf` to requirements.txt to enable direct PDF export."
+                    help="Add `fpdf2` to requirements.txt to enable direct PDF export."
                 )
             st.caption("📄 Native PDF (emojis omitted for clean print)")
 
