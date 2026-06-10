@@ -1,10 +1,15 @@
-# Company Image Sentiment Analyzer  (CB-tuned, v4)
-# ------------------------------------------------
+# Company Image Sentiment Analyzer  (CB-tuned, v6 — adds Paste-Text mode)
+# ------------------------------------------------------------------
 # Install:
-#   pip install streamlit trafilatura transformers torch beautifulsoup4 requests pandas reportlab
+#   pip install streamlit trafilatura transformers torch beautifulsoup4 requests pandas reportlab fpdf2
 #
 # Run:
 #   streamlit run company_sentiment_analyzer.py
+#
+# v6 change: in addition to analyzing URLs, you can now paste raw article
+# text and run the SAME analysis pipeline on it (sentiment, positioning
+# alignment, business outcomes, coverage type). See `analyze_text` and the
+# "Pasted article text" input mode in the UI.
 
 import streamlit as st
 import requests
@@ -861,7 +866,37 @@ class EnhancedCompanyAnalyzer:
         return {'outcomes': top_outcomes, 'cb_mentioned': True, 'explanation': explanation}
 
     # ------------------------------------------------------------------ #
-    # Orchestration
+    # Shared analysis core — runs the SAME pipeline for URLs and pasted text
+    # ------------------------------------------------------------------ #
+    def _analyze_content(self, url, title, text, key_sentences, headline_for_scoring=None):
+        """Run sentiment, alignment, outcomes and coverage on already-extracted
+        content. `url` is used only for coverage-type domain checks (may be
+        empty for pasted text). `headline_for_scoring` controls the headline-
+        first stage: pass the real headline to enable it, or "" to skip it
+        (used by pasted text with no genuine headline)."""
+        scoring_title = title if headline_for_scoring is None else headline_for_scoring
+
+        sentiment = self.analyze_sentiment_with_explanation(text, title=scoring_title)
+        alignment = self.check_alignment_with_explanation(
+            text, cb_mentioned=sentiment.get('cb_mentioned', False)
+        )
+        outcomes = self.determine_outcomes_with_explanation(
+            text, sentiment['label'], alignment['pillars']
+        )
+        coverage = self.classify_coverage_type(
+            url, text, cb_mentioned=sentiment.get('cb_mentioned', False)
+        )
+
+        return {
+            'url': url, 'title': title, 'status': 'Success',
+            'error': False, 'paywall': False, 'corrupted': False,
+            'sentiment': sentiment, 'alignment': alignment, 'outcomes': outcomes,
+            'coverage': coverage, 'key_sentences': key_sentences[:5],
+            'text_preview': text[:300] + "..."
+        }
+
+    # ------------------------------------------------------------------ #
+    # Orchestration — URL path
     # ------------------------------------------------------------------ #
     def analyze_url(self, url):
         page_data = self.fetch_page_content(url)
@@ -904,24 +939,76 @@ class EnhancedCompanyAnalyzer:
                 'key_sentences': []
             }
 
-        sentiment = self.analyze_sentiment_with_explanation(page_data['text'], title=page_data['title'])
-        alignment = self.check_alignment_with_explanation(
-            page_data['text'], cb_mentioned=sentiment.get('cb_mentioned', False)
-        )
-        outcomes = self.determine_outcomes_with_explanation(
-            page_data['text'], sentiment['label'], alignment['pillars']
-        )
-        coverage = self.classify_coverage_type(
-            url, page_data['text'], cb_mentioned=sentiment.get('cb_mentioned', False)
+        return self._analyze_content(
+            url=url,
+            title=page_data['title'],
+            text=page_data['text'],
+            key_sentences=page_data['key_sentences'],
+            headline_for_scoring=None,  # use the extracted title as a real headline
         )
 
-        return {
-            'url': url, 'title': page_data['title'], 'status': 'Success',
-            'error': False, 'paywall': False, 'corrupted': False,
-            'sentiment': sentiment, 'alignment': alignment, 'outcomes': outcomes,
-            'coverage': coverage, 'key_sentences': page_data['key_sentences'][:5],
-            'text_preview': page_data['text'][:300] + "..."
-        }
+    # ------------------------------------------------------------------ #
+    # Orchestration — PASTED TEXT path (v6)
+    # ------------------------------------------------------------------ #
+    def analyze_text(self, raw_text, headline="", source_url=""):
+        """Run the full analysis pipeline on user-pasted article text.
+
+        Mirrors `analyze_url` but skips fetching. `headline` is optional: if
+        provided it feeds the CB-gated headline-first stage exactly as a real
+        headline would; if blank, scoring uses the body only (the auto display
+        title is NOT scored, so it can't short-circuit the result).
+        `source_url` is optional and used only for Owned/PR-wire coverage
+        detection."""
+        text = re.sub(r'\s+', ' ', (raw_text or "")).strip()
+        headline = (headline or "").strip()
+        source_url = (source_url or "").strip()
+
+        # ---- Too short to analyze: return an error-shaped result ----
+        if len(text) < 50:
+            explanation = ('Pasted text is too short to analyze (need at least ~50 '
+                           'characters of article content).')
+            return {
+                'url': source_url or '(pasted text)',
+                'title': headline or 'Pasted Text (too short)',
+                'status': 'Too Short',
+                'error': True, 'paywall': False, 'corrupted': False,
+                'sentiment': {'label': 'neutral', 'score': 0.0, 'needs_review': True,
+                              'cb_mentioned': False, 'cb_relevance': 0, 'focus_mode': 'full',
+                              'scored_text': '', 'scored_excerpts': [], 'chunk_breakdown': [],
+                              'finance_guard_fired': False, 'explanation': explanation},
+                'alignment': {'status': 'NO', 'score': 0, 'explanation': explanation, 'matches': []},
+                'outcomes': {'outcomes': [], 'cb_mentioned': False, 'explanation': explanation},
+                'coverage': {'type': 'Unknown', 'icon': '❓', 'reason': explanation},
+                'key_sentences': []
+            }
+
+        # ---- Display title: headline if given, else first words of the body ----
+        if headline:
+            display_title = self._clean_title(headline) or headline[:120]
+        else:
+            snippet = text[:80].strip()
+            if len(text) > 80:
+                snippet = snippet.rsplit(' ', 1)[0] + '…'
+            display_title = snippet or 'Pasted Text'
+
+        # ---- Key sentences (context excerpts), same rule as the URL path ----
+        sentences = re.split(r'(?<=[.!?])\s+', text)
+        key_sentences = [s.strip() for s in sentences if len(s.strip()) > 60][:10]
+
+        # Cap body length to match the 8k limit used for fetched pages.
+        text = text[:8000]
+
+        result = self._analyze_content(
+            url=source_url,                  # blank => coverage falls back to text patterns
+            title=display_title,
+            text=text,
+            key_sentences=key_sentences,
+            headline_for_scoring=headline,   # "" => headline-first stage is skipped
+        )
+        # Mark the URL field nicely when no source was supplied.
+        if not source_url:
+            result['url'] = '(pasted text)'
+        return result
 
 
 # ------------------------------------------------------------------ #
@@ -976,9 +1063,10 @@ def create_html_report(results):
     <body>
         <h1>🏢 Company Image Sentiment Analysis Report</h1>
         <p><strong>Generated:</strong> {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}</p>
-        <p><em>v5 — near-tie neutral disambiguation, finance false-negative guard,
-        per-chunk diagnostics, word-boundary excerpt truncation; on top of v4
-        title fallback, CB-gated headline-first, scored-text display, CB-focused text.</em></p>
+        <p><em>v6 — adds pasted-text analysis (same pipeline as URLs); on top of v5
+        near-tie neutral disambiguation, finance false-negative guard, per-chunk
+        diagnostics, word-boundary excerpts; and v4 title fallback, CB-gated
+        headline-first, scored-text display, CB-focused text.</em></p>
 
         <div class="summary">
             <h2>Executive Summary</h2>
@@ -1029,7 +1117,7 @@ def create_html_report(results):
             continue
 
         if result.get('error', False):
-            status_label = "CORRUPTED" if result.get('corrupted') else "FAILED"
+            status_label = "CORRUPTED" if result.get('corrupted') else result.get('status', 'FAILED').upper()
             html_content += f"""
             <div class="article">
                 <h3>{idx}. {result['title']}</h3>
@@ -1134,8 +1222,8 @@ def create_html_report(results):
 
     html_content += """
         <div class="footer">
-            <p>Report generated by Company Image Sentiment Analyzer v5</p>
-            <p>Near-tie neutral disambiguation · finance false-negative guard · per-chunk diagnostics · word-boundary excerpts · CB-gated headline-first · scored-text display · CB-focused text · CB mention gate · corrupted-content voiding · paywall detection</p>
+            <p>Report generated by Company Image Sentiment Analyzer v6</p>
+            <p>Pasted-text analysis · near-tie neutral disambiguation · finance false-negative guard · per-chunk diagnostics · word-boundary excerpts · CB-gated headline-first · scored-text display · CB-focused text · CB mention gate · corrupted-content voiding · paywall detection</p>
         </div>
     </body>
     </html>
@@ -1256,7 +1344,7 @@ def create_pdf_report(results):
                 continue
 
             if result.get('error', False):
-                status_label = "CORRUPTED" if result.get('corrupted') else "FAILED"
+                status_label = "CORRUPTED" if result.get('corrupted') else result.get('status', 'FAILED').upper()
                 line(f"Status: {status_label}", size=9, color=(231, 76, 60))
                 line(result['sentiment'].get('explanation', ''), size=9, color=(90, 90, 90))
                 pdf.ln(3)
@@ -1304,13 +1392,98 @@ def create_pdf_report(results):
 
         # ---- Footer note ----
         pdf.ln(2)
-        line("Report generated by Company Image Sentiment Analyzer v5", size=8, color=(120, 120, 120))
+        line("Report generated by Company Image Sentiment Analyzer v6", size=8, color=(120, 120, 120))
 
         out = pdf.output()  # fpdf2 >= 2.x returns a bytearray
         return bytes(out)
 
     except Exception:
         return None
+
+
+# ------------------------------------------------------------------ #
+# Export buttons (shared by both input modes)
+# ------------------------------------------------------------------ #
+def render_exports(results):
+    st.markdown("---")
+    st.markdown("### 📄 Export Results")
+
+    col1, col2, col3, col4 = st.columns(4)
+
+    with col1:
+        df = pd.DataFrame([{
+            'URL': r['url'],
+            'Title': r['title'],
+            'Status': r['status'],
+            'Sentiment': r['sentiment']['label'].upper() if not r.get('error') else 'ERROR',
+            'Confidence': f"{r['sentiment']['score']:.1%}" if not r.get('error') else 'N/A',
+            'Needs Review': r['sentiment'].get('needs_review', True) if not r.get('error') else True,
+            'Focus Mode': r['sentiment'].get('focus_mode', 'full') if not r.get('error') else 'N/A',
+            'Finance Guard': r['sentiment'].get('finance_guard_fired', False) if not r.get('error') else False,
+            'Scored Text': r['sentiment'].get('scored_text', '')[:500] if not r.get('error') else '',
+            'CB Relevance': r['sentiment'].get('cb_relevance', 0) if not r.get('error') else 0,
+            'Alignment': r['alignment']['status'] if not r.get('error') else 'N/A',
+            'Alignment Score': r['alignment'].get('score', 0) if not r.get('error') else 0,
+            'CB Mentioned': r['outcomes'].get('cb_mentioned', False) if not r.get('error') else False,
+            'Coverage Type': r.get('coverage', {}).get('type', 'Unknown'),
+            'Coverage Reason': r.get('coverage', {}).get('reason', ''),
+            'Outcomes': ', '.join([o['outcome'] for o in r['outcomes']['outcomes']]) if not r.get('error') and r['outcomes']['outcomes'] else '',
+            'Paywall': r.get('paywall', False),
+            'Explanation': r['sentiment']['explanation'] if not r.get('error') else ''
+        } for r in results])
+
+        csv = df.to_csv(index=False)
+        st.download_button(
+            label="📥 Download CSV",
+            data=csv,
+            file_name=f"sentiment_analysis_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+            mime="text/csv",
+            use_container_width=True
+        )
+
+    with col2:
+        json_data = json.dumps(results, default=str, indent=2)
+        st.download_button(
+            label="📥 Download JSON",
+            data=json_data,
+            file_name=f"sentiment_analysis_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
+            mime="application/json",
+            use_container_width=True
+        )
+
+    with col3:
+        html_report = create_html_report(results)
+        st.download_button(
+            label="📥 Download HTML Report",
+            data=html_report,
+            file_name=f"sentiment_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.html",
+            mime="text/html",
+            use_container_width=True
+        )
+        st.caption("💡 Or open the HTML and Print → Save as PDF")
+
+    with col4:
+        if FPDF_AVAILABLE:
+            pdf_bytes = create_pdf_report(results)
+            if pdf_bytes:
+                st.download_button(
+                    label="📥 Download PDF",
+                    data=pdf_bytes,
+                    file_name=f"sentiment_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf",
+                    mime="application/pdf",
+                    use_container_width=True
+                )
+            else:
+                st.button(
+                    "📥 Download PDF", disabled=True, use_container_width=True,
+                    help="PDF generation failed for this batch — use the HTML report instead."
+                )
+        else:
+            st.button(
+                "📥 Download PDF", disabled=True, use_container_width=True,
+                help="Add `fpdf2` to requirements.txt to enable direct PDF export."
+            )
+        st.caption("📄 Native PDF (emojis omitted for clean print)")
 
 
 # ------------------------------------------------------------------ #
@@ -1384,7 +1557,8 @@ def main():
             "- Check '🔬 Scored Text' to see exactly what FinBERT read\n"
             "- Check the per-chunk read to see which chunk drove the score\n"
             "- Download CSV and filter 'Needs Review = TRUE' first\n"
-            "- Lower the threshold if too many true-positive CB articles get flagged"
+            "- Lower the threshold if too many true-positive CB articles get flagged\n"
+            "- **Paste-text mode:** add a Headline only if the source actually has one"
         )
 
     analyzer = st.session_state.analyzer
@@ -1393,137 +1567,134 @@ def main():
     analyzer.neutral_margin = neutral_margin
     analyzer.finance_guard = finance_guard
 
-    st.markdown("### 📝 Enter URLs to Analyze")
+    # ---- Top-level input mode: URLs vs pasted text ----
+    st.markdown("### 🧭 Choose what to analyze")
+    source_type = st.radio(
+        "Input source:",
+        ["Analyze URLs", "Analyze pasted text"],
+        horizontal=True,
+        help="URLs are fetched and scraped. Pasted text is analyzed directly with "
+             "the exact same FinBERT + CB-tuning pipeline (useful for paywalled, "
+             "PDF, newsletter, or print coverage you already have in hand)."
+    )
 
-    col1, col2 = st.columns([3, 1])
-    with col1:
-        input_method = st.radio("Input method:", ["Paste URLs", "Use Examples"], horizontal=True)
+    # ============================================================== #
+    # MODE 1 — URLs (unchanged behavior)
+    # ============================================================== #
+    if source_type == "Analyze URLs":
+        st.markdown("### 📝 Enter URLs to Analyze")
 
-    urls = []
-    if input_method == "Paste URLs":
-        url_text = st.text_area(
-            "Enter one URL per line:",
-            height=150,
-            placeholder="https://example.com/article1\nhttps://example.com/article2"
-        )
-        urls = [u.strip() for u in url_text.split('\n') if u.strip()]
-    else:
-        example_urls = [
-            "https://www.climatefinancelab.org",
-            "https://www.energyaccess.org",
-            "https://www.ifc.org"
-        ]
-        urls = example_urls
-        st.success(f"📋 Loaded {len(urls)} example URLs")
-
-    analyze_btn = st.button("🔍 Analyze URLs", type="primary", use_container_width=True)
-
-    if analyze_btn and urls:
-        progress_bar = st.progress(0)
-        status_text = st.empty()
-        results = []
-
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = {executor.submit(analyzer.analyze_url, url): url for url in urls}
-            for idx, future in enumerate(as_completed(futures)):
-                result = future.result()
-                results.append(result)
-                progress_bar.progress((idx + 1) / len(urls))
-                status_text.text(f"Analyzed {idx + 1}/{len(urls)} URLs")
-
-        st.session_state.results = results
-
-        successful = [r for r in results if not r.get('error', False)]
-        st.success(f"✅ Analysis complete! {len(successful)}/{len(results)} URLs successfully analyzed")
-
-        display_detailed_results(results)
-
-        st.markdown("---")
-        st.markdown("### 📄 Export Results")
-
-        col1, col2, col3, col4 = st.columns(4)
-
+        col1, col2 = st.columns([3, 1])
         with col1:
-            df = pd.DataFrame([{
-                'URL': r['url'],
-                'Title': r['title'],
-                'Status': r['status'],
-                'Sentiment': r['sentiment']['label'].upper() if not r.get('error') else 'ERROR',
-                'Confidence': f"{r['sentiment']['score']:.1%}" if not r.get('error') else 'N/A',
-                'Needs Review': r['sentiment'].get('needs_review', True) if not r.get('error') else True,
-                'Focus Mode': r['sentiment'].get('focus_mode', 'full') if not r.get('error') else 'N/A',
-                'Finance Guard': r['sentiment'].get('finance_guard_fired', False) if not r.get('error') else False,
-                'Scored Text': r['sentiment'].get('scored_text', '')[:500] if not r.get('error') else '',
-                'CB Relevance': r['sentiment'].get('cb_relevance', 0) if not r.get('error') else 0,
-                'Alignment': r['alignment']['status'] if not r.get('error') else 'N/A',
-                'Alignment Score': r['alignment'].get('score', 0) if not r.get('error') else 0,
-                'CB Mentioned': r['outcomes'].get('cb_mentioned', False) if not r.get('error') else False,
-                'Coverage Type': r.get('coverage', {}).get('type', 'Unknown'),
-                'Coverage Reason': r.get('coverage', {}).get('reason', ''),
-                'Outcomes': ', '.join([o['outcome'] for o in r['outcomes']['outcomes']]) if not r.get('error') and r['outcomes']['outcomes'] else '',
-                'Paywall': r.get('paywall', False),
-                'Explanation': r['sentiment']['explanation'] if not r.get('error') else ''
-            } for r in results])
+            input_method = st.radio("Input method:", ["Paste URLs", "Use Examples"], horizontal=True)
 
-            csv = df.to_csv(index=False)
-            st.download_button(
-                label="📥 Download CSV",
-                data=csv,
-                file_name=f"sentiment_analysis_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-                mime="text/csv",
-                use_container_width=True
+        urls = []
+        if input_method == "Paste URLs":
+            url_text = st.text_area(
+                "Enter one URL per line:",
+                height=150,
+                placeholder="https://example.com/article1\nhttps://example.com/article2"
+            )
+            urls = [u.strip() for u in url_text.split('\n') if u.strip()]
+        else:
+            example_urls = [
+                "https://www.climatefinancelab.org",
+                "https://www.energyaccess.org",
+                "https://www.ifc.org"
+            ]
+            urls = example_urls
+            st.success(f"📋 Loaded {len(urls)} example URLs")
+
+        analyze_btn = st.button("🔍 Analyze URLs", type="primary", use_container_width=True)
+
+        if analyze_btn and urls:
+            progress_bar = st.progress(0)
+            status_text = st.empty()
+            results = []
+
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = {executor.submit(analyzer.analyze_url, url): url for url in urls}
+                for idx, future in enumerate(as_completed(futures)):
+                    result = future.result()
+                    results.append(result)
+                    progress_bar.progress((idx + 1) / len(urls))
+                    status_text.text(f"Analyzed {idx + 1}/{len(urls)} URLs")
+
+            st.session_state.results = results
+
+            successful = [r for r in results if not r.get('error', False)]
+            st.success(f"✅ Analysis complete! {len(successful)}/{len(results)} URLs successfully analyzed")
+
+            display_detailed_results(results)
+            render_exports(results)
+
+        elif analyze_btn and not urls:
+            st.warning("⚠️ Please enter at least one URL to analyze")
+
+        elif 'results' in st.session_state and st.session_state.results:
+            if st.button("📊 Show Previous Results"):
+                display_detailed_results(st.session_state.results)
+
+    # ============================================================== #
+    # MODE 2 — Pasted text (v6, same pipeline)
+    # ============================================================== #
+    else:
+        st.markdown("### 📋 Paste Article Text to Analyze")
+        st.caption(
+            "Paste the full article body below. The text runs through the exact same "
+            "FinBERT + CrossBoundary-tuning pipeline used for URLs — sentiment, "
+            "positioning alignment, business outcomes, and coverage type."
+        )
+
+        pasted_text = st.text_area(
+            "Article text:",
+            height=300,
+            placeholder="Paste the article content here (at least a paragraph or two)..."
+        )
+
+        col_a, col_b = st.columns(2)
+        with col_a:
+            pasted_headline = st.text_input(
+                "Headline (optional)",
+                placeholder="Leave blank if the source has no real headline",
+                help="If you provide a headline that NAMES CrossBoundary, the CB-gated "
+                     "headline-first stage runs exactly as it does for URLs. If left "
+                     "blank, scoring uses the body text only."
+            )
+        with col_b:
+            pasted_source_url = st.text_input(
+                "Source URL (optional)",
+                placeholder="e.g. https://prnewswire.com/... or a CB-owned domain",
+                help="Used only to classify coverage type (Owned / PR-wire). "
+                     "Leave blank to let coverage type be inferred from the text alone."
             )
 
-        with col2:
-            json_data = json.dumps(results, default=str, indent=2)
-            st.download_button(
-                label="📥 Download JSON",
-                data=json_data,
-                file_name=f"sentiment_analysis_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
-                mime="application/json",
-                use_container_width=True
-            )
+        analyze_text_btn = st.button("🔍 Analyze Pasted Text", type="primary", use_container_width=True)
 
-        with col3:
-            html_report = create_html_report(results)
-            st.download_button(
-                label="📥 Download HTML Report",
-                data=html_report,
-                file_name=f"sentiment_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.html",
-                mime="text/html",
-                use_container_width=True
-            )
-            st.caption("💡 Or open the HTML and Print → Save as PDF")
-
-        with col4:
-            if FPDF_AVAILABLE:
-                pdf_bytes = create_pdf_report(results)
-                if pdf_bytes:
-                    st.download_button(
-                        label="📥 Download PDF",
-                        data=pdf_bytes,
-                        file_name=f"sentiment_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf",
-                        mime="application/pdf",
-                        use_container_width=True
-                    )
-                else:
-                    st.button(
-                        "📥 Download PDF", disabled=True, use_container_width=True,
-                        help="PDF generation failed for this batch — use the HTML report instead."
-                    )
-            else:
-                st.button(
-                    "📥 Download PDF", disabled=True, use_container_width=True,
-                    help="Add `fpdf2` to requirements.txt to enable direct PDF export."
+        if analyze_text_btn and pasted_text.strip():
+            with st.spinner("Analyzing pasted text with FinBERT..."):
+                result = analyzer.analyze_text(
+                    raw_text=pasted_text,
+                    headline=pasted_headline,
+                    source_url=pasted_source_url,
                 )
-            st.caption("📄 Native PDF (emojis omitted for clean print)")
+            results = [result]
+            st.session_state.results = results
 
-    elif analyze_btn and not urls:
-        st.warning("⚠️ Please enter at least one URL to analyze")
+            if result.get('error'):
+                st.warning(f"⚠️ {result['status']}: {result['sentiment']['explanation']}")
+            else:
+                st.success("✅ Analysis complete!")
 
-    elif 'results' in st.session_state and st.session_state.results:
-        if st.button("📊 Show Previous Results"):
-            display_detailed_results(st.session_state.results)
+            display_detailed_results(results)
+            render_exports(results)
+
+        elif analyze_text_btn and not pasted_text.strip():
+            st.warning("⚠️ Please paste some article text to analyze")
+
+        elif 'results' in st.session_state and st.session_state.results:
+            if st.button("📊 Show Previous Results"):
+                display_detailed_results(st.session_state.results)
 
 
 def display_detailed_results(results):
@@ -1605,6 +1776,8 @@ def display_detailed_results(results):
                 st.code(result['url'])
                 if corrupted_flag:
                     st.warning("💥 Corrupted binary content was detected and voided. Re-run or log manually.")
+                else:
+                    st.info(result['sentiment'].get('explanation', ''))
                 continue
 
             st.markdown(f"**URL:** {result['url']}")
