@@ -926,27 +926,38 @@ def create_html_report(results):
         <meta charset="UTF-8">
         <title>Sentiment Analysis Report</title>
         <style>
-            body {{ font-family: Arial, sans-serif; margin: 40px; line-height: 1.6; }}
-            h1 {{ color: #667eea; border-bottom: 2px solid #667eea; padding-bottom: 10px; }}
-            h2 {{ color: #764ba2; margin-top: 30px; }}
-            h3 {{ color: #333; margin-top: 20px; }}
-            .summary {{ background: #f0f2f6; padding: 20px; border-radius: 10px; margin: 20px 0; }}
-            .article {{ border: 1px solid #ddd; padding: 20px; margin: 20px 0; border-radius: 10px; page-break-inside: avoid; }}
+            body {{
+                font-family: Arial, sans-serif;
+                margin: 24px;
+                line-height: 1.4;
+                font-size: 12px;
+                color: #222;
+            }}
+            h1 {{ font-size: 1.5em; color: #667eea; border-bottom: 2px solid #667eea; padding-bottom: 6px; margin: 0 0 12px; }}
+            h2 {{ font-size: 1.2em; color: #764ba2; margin: 16px 0 6px; }}
+            h3 {{ font-size: 1.05em; color: #333; margin: 14px 0 6px; }}
+            h4 {{ font-size: 0.95em; margin: 10px 0 4px; }}
+            p {{ margin: 4px 0; }}
+            ul {{ margin: 4px 0; padding-left: 18px; }}
+            li {{ margin: 2px 0; }}
+            a {{ word-break: break-all; }}
+            .summary {{ background: #f0f2f6; padding: 12px 16px; border-radius: 8px; margin: 12px 0; }}
+            .article {{ border: 1px solid #ddd; padding: 12px 16px; margin: 12px 0; border-radius: 8px; page-break-inside: avoid; }}
             .sentiment-positive {{ color: #27ae60; font-weight: bold; }}
             .sentiment-negative {{ color: #e74c3c; font-weight: bold; }}
             .sentiment-neutral {{ color: #f39c12; font-weight: bold; }}
             .alignment-yes {{ color: #27ae60; font-weight: bold; }}
             .alignment-partial {{ color: #f39c12; font-weight: bold; }}
             .alignment-no {{ color: #e74c3c; font-weight: bold; }}
-            .explanation {{ background: #f8f9fa; padding: 15px; border-left: 4px solid #667eea; margin: 10px 0; }}
-            .scored {{ background: #eef4ff; padding: 15px; border-left: 4px solid #3b6fe0; margin: 10px 0; }}
-            .needs-review {{ background: #fff8e1; padding: 15px; border-left: 4px solid #f39c12; margin: 10px 0; }}
-            .error-paywall {{ background: #fff3f3; padding: 15px; border-left: 4px solid #e74c3c; margin: 10px 0; }}
+            .explanation {{ background: #f8f9fa; padding: 8px 12px; border-left: 4px solid #667eea; margin: 6px 0; }}
+            .scored {{ background: #eef4ff; padding: 8px 12px; border-left: 4px solid #3b6fe0; margin: 6px 0; }}
+            .needs-review {{ background: #fff8e1; padding: 8px 12px; border-left: 4px solid #f39c12; margin: 6px 0; }}
+            .error-paywall {{ background: #fff3f3; padding: 8px 12px; border-left: 4px solid #e74c3c; margin: 6px 0; }}
             .keyword {{ background: #fff3cd; padding: 2px 5px; border-radius: 3px; font-family: monospace; }}
-            .footer {{ text-align: center; margin-top: 50px; padding-top: 20px; border-top: 1px solid #ddd; font-size: 12px; color: #666; }}
-            .badge-review {{ background: #f39c12; color: white; padding: 2px 8px; border-radius: 10px; font-size: 11px; margin-left: 8px; }}
-            .badge-paywall {{ background: #e74c3c; color: white; padding: 2px 8px; border-radius: 10px; font-size: 11px; margin-left: 8px; }}
-            .badge-cb {{ background: #27ae60; color: white; padding: 2px 8px; border-radius: 10px; font-size: 11px; margin-left: 8px; }}
+            .footer {{ text-align: center; margin-top: 24px; padding-top: 10px; border-top: 1px solid #ddd; font-size: 10px; color: #666; }}
+            .badge-review {{ background: #f39c12; color: white; padding: 1px 7px; border-radius: 10px; font-size: 10px; margin-left: 6px; }}
+            .badge-paywall {{ background: #e74c3c; color: white; padding: 1px 7px; border-radius: 10px; font-size: 10px; margin-left: 6px; }}
+            .badge-cb {{ background: #27ae60; color: white; padding: 1px 7px; border-radius: 10px; font-size: 10px; margin-left: 6px; }}
             .coverage-owned {{ color: #2980b9; font-weight: bold; }}
             .coverage-proactive {{ color: #8e44ad; font-weight: bold; }}
             .coverage-earned {{ color: #27ae60; font-weight: bold; }}
