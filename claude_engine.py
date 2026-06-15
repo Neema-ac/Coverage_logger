@@ -49,7 +49,8 @@ Analyze one piece of coverage and return ONLY a JSON object (no markdown, no bac
   "cb_mentioned": boolean,       // is CrossBoundary actually named / discussed?
   "quote": string                // one short notable quote pulled verbatim, "" if none
 }
-Judge sentiment by reputational impact: factual-but-damaging coverage is Negative even if the tone is neutral."""
+Judge sentiment by reputational impact: factual-but-damaging coverage is Negative even if the tone is neutral.
+Output must be a single valid JSON object. Keep "quote" short (under 20 words) and escape any double quotes or newlines inside string values so the JSON parses cleanly."""
 
 
 _PILLAR_KEY = {
@@ -63,6 +64,55 @@ _VALID_OUTCOMES = {
     "BD Support", "Investor Narrative", "Talent & Reputation",
     "Partnership", "Award/Recognition",
 }
+
+
+def _balance_json(s):
+    """Best-effort repair of a truncated/unbalanced JSON object: close an open
+    string and any unclosed brackets so json.loads can finish the parse."""
+    out, stack = [], []
+    in_str = escape = False
+    for ch in s:
+        if escape:
+            out.append(ch); escape = False; continue
+        if ch == "\\":
+            out.append(ch); escape = True; continue
+        if ch == '"':
+            in_str = not in_str
+        elif not in_str:
+            if ch in "{[":
+                stack.append(ch)
+            elif ch in "}]" and stack:
+                stack.pop()
+        out.append(ch)
+    res = "".join(out)
+    if in_str:
+        res += '"'                       # close a string the model cut off
+    res = re.sub(r",\s*$", "", res)      # drop a dangling trailing comma
+    for opener in reversed(stack):       # close any open brackets
+        res += "}" if opener == "{" else "]"
+    return res
+
+
+def _coerce_json(raw):
+    """Parse model output into a dict, tolerating code fences, prose around the
+    JSON, literal control characters, and truncated/unterminated output."""
+    if not raw:
+        raise ValueError("Empty model response")
+    s = raw.replace("```json", "").replace("```", "").strip()
+    start = s.find("{")
+    if start == -1:
+        raise ValueError("No JSON object found in model output")
+
+    # 1) Parse the first complete object; ignore any trailing prose.
+    #    strict=False also allows literal newlines/tabs inside strings.
+    try:
+        obj, _ = json.JSONDecoder(strict=False).raw_decode(s, start)
+        return obj
+    except Exception:
+        pass
+
+    # 2) Repair a truncated/unbalanced object and try once more.
+    return json.loads(_balance_json(s[start:]), strict=False)
 
 
 class ClaudeAnalyzer:
@@ -98,15 +148,14 @@ class ClaudeAnalyzer:
 
         msg = self.client.messages.create(
             model=self.model,
-            max_tokens=1000,
+            max_tokens=2000,
             system=CLAUDE_SYSTEM,
             messages=[{"role": "user", "content": user}],
         )
         raw = "".join(
             b.text for b in msg.content if getattr(b, "type", "") == "text"
-        ).replace("```json", "").replace("```", "").strip()
-        m = re.search(r"\{[\s\S]*\}", raw)
-        return json.loads(m.group(0) if m else raw)
+        )
+        return _coerce_json(raw)
 
     # ------------------------------------------------------------------ #
     # Map Claude's JSON into the result dict the rest of the app expects
