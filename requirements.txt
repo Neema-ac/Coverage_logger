@@ -10,3 +10,4 @@ fpdf
 trafilatura
 fpdf2
 openai
+anthropic
