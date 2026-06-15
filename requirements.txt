@@ -9,3 +9,4 @@ typing-extensions>=4.0.0
 fpdf
 trafilatura
 fpdf2
+openai
