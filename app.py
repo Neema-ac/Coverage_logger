@@ -1,10 +1,16 @@
-# Company Image Sentiment Analyzer  (CB-tuned, v7 — pluggable analysis engine)
+# Company Image Sentiment Analyzer  (CB-tuned, v8 — syndicated-PR detection)
 # ------------------------------------------------------------------
 # Install:
 #   pip install streamlit trafilatura transformers torch beautifulsoup4 requests pandas reportlab fpdf2 anthropic openai
 #
 # Run:
 #   streamlit run app.py
+#
+# v8 change: coverage-type classification now catches SYNDICATED press
+#   releases — a CB release reposted verbatim on a third-party news site is
+#   routed to Proactive instead of being mislabeled Earned. Because the two
+#   LLM engines (Claude, Gemini) delegate coverage typing to this file's
+#   classify_coverage_type(), this single change fixes all three engines.
 #
 # v7 change: the analysis "engine" is now selectable in the sidebar.
 #   - Gemini (free tier)  -> free LLM, matches your Claude artifact closely
@@ -170,6 +176,8 @@ PR_WIRE_DOMAINS = [
     "prnewswire.com", "businesswire.com", "globenewswire.com",
     "accesswire.com", "prweb.com", "einpresswire.com", "newswire.com",
     "presswire.com", "send2press.com",
+    # v8: APO Group distribution domains (the wire CB uses across Africa)
+    "apo-opa.com", "africa-newsroom.com",
 ]
 
 PROACTIVE_PATTERNS = [
@@ -190,6 +198,32 @@ PROACTIVE_PATTERNS = [
     (r'crossboundary(?:\s+energy|\s+advisory|\s+access|\s+group)?\s+'
      r'(?:said|noted|stated|confirmed|commented|added)',
      "CB organisation statement"),
+]
+
+# ------------------------------------------------------------------ #
+# Syndicated-PR detection (v8)
+# A release reposted VERBATIM on a third-party news site is NOT earned
+# editorial — it's CB-initiated content living on someone else's domain.
+# These BODY-TEXT cues catch reposts the URL-based PR_WIRE_DOMAINS check
+# misses (the repost URL is the news site, not the wire). High-precision
+# only, so a single hit can route to Proactive without misfiling earned.
+# ------------------------------------------------------------------ #
+SYNDICATION_WIRE_CUES = [
+    (r'\bdistributed by\b[^.]{0,40}\bapo group\b', "wire credit: 'Distributed by APO Group'"),
+    (r'\bapo group\b',                              "wire service named (APO Group)"),
+    (r'\bsource\s*:\s*apo\b',                       "wire credit: 'Source: APO'"),
+    (r'\bdistributed by\b',                         "syndication credit: 'Distributed by …'"),
+    (r'\bissued by\b[^.]{0,40}crossboundary',       "release attribution: 'issued by … CrossBoundary'"),
+    (r'\bthis press release\b',                      "self-referential 'this press release'"),
+]
+
+# Media/press-contact block — editorial outlets strip these; PR reposts keep
+# them. Only treated as a syndication signal when a CrossBoundary contact is
+# also present (see _detect_syndicated_pr), so it stays high-precision.
+SYNDICATION_CONTACT_PATTERNS = [
+    (r'media\s+(?:contact|enquiries|inquiries|relations)\b', "media-contact block"),
+    (r'press\s+(?:contact|office|enquiries|inquiries)\b',     "press-contact block"),
+    (r'for\s+(?:media|press)\s+(?:enquiries|inquiries|queries)\b', "press-enquiries line"),
 ]
 
 
@@ -482,6 +516,30 @@ class EnhancedCompanyAnalyzer:
         return any(self._cb_sentence_match(s.lower()) for s in sentences)
 
     # ------------------------------------------------------------------ #
+    # Syndicated-PR detection (v8)
+    # ------------------------------------------------------------------ #
+    def _detect_syndicated_pr(self, text_lower):
+        """Detect a syndicated/republished CB release on a third-party domain.
+        Returns a reason string if detected, else None. High-precision cues
+        only, so genuine earned coverage isn't misrouted to Proactive."""
+        # Strong, single-hit cue: explicit wire / syndication attribution.
+        for pattern, label in SYNDICATION_WIRE_CUES:
+            if re.search(pattern, text_lower):
+                return label
+        # Weaker cue: a contact block, but ONLY when it points back to CB
+        # (a CrossBoundary email/domain present) — that combination is PR,
+        # not editorial.
+        has_cb_contact = (
+            bool(re.search(r'crossboundary[\w.\-]*@|@[\w.\-]*crossboundary', text_lower))
+            or 'crossboundary.com' in text_lower
+        )
+        if has_cb_contact:
+            for pattern, label in SYNDICATION_CONTACT_PATTERNS:
+                if re.search(pattern, text_lower):
+                    return f"{label} with a CrossBoundary contact"
+        return None
+
+    # ------------------------------------------------------------------ #
     # Coverage type classification
     # ------------------------------------------------------------------ #
     def classify_coverage_type(self, url, text, cb_mentioned):
@@ -508,6 +566,14 @@ class EnhancedCompanyAnalyzer:
             if re.search(pattern, text_lower):
                 return {'type': 'Proactive', 'icon': '📣',
                         'reason': f'CB-initiated signal: {label}'}
+
+        # v8: syndicated-PR catch — a verbatim release reposted on a third-
+        # party site. Runs BEFORE the Earned fallback so reposts don't inflate
+        # the Earned (independent-journalism) count.
+        syndication_reason = self._detect_syndicated_pr(text_lower)
+        if syndication_reason:
+            return {'type': 'Proactive', 'icon': '📣',
+                    'reason': f'Syndicated press release: {syndication_reason}'}
 
         return {'type': 'Earned', 'icon': '📰',
                 'reason': 'CB mentioned in independent third-party coverage'}
@@ -1075,10 +1141,11 @@ def create_html_report(results):
     <body>
         <h1>🏢 Company Image Sentiment Analysis Report</h1>
         <p><strong>Generated:</strong> {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}</p>
-        <p><em>v7 — pluggable analysis engine (Gemini / Claude / FinBERT). LLM engines
-        use the same reputational-sentiment prompt as the Claude artifact; FinBERT path
-        retains v6 pasted-text analysis, v5 near-tie neutral disambiguation, finance
-        false-negative guard, per-chunk diagnostics, and word-boundary excerpts.</em></p>
+        <p><em>v8 — pluggable analysis engine (Gemini / Claude / FinBERT) with syndicated-PR
+        coverage detection. LLM engines use the same reputational-sentiment prompt as the Claude
+        artifact and delegate coverage typing to the rule-based classifier; FinBERT path retains
+        v6 pasted-text analysis, v5 near-tie neutral disambiguation, finance false-negative guard,
+        per-chunk diagnostics, and word-boundary excerpts.</em></p>
 
         <div class="summary">
             <h2>Executive Summary</h2>
@@ -1235,8 +1302,8 @@ def create_html_report(results):
 
     html_content += """
         <div class="footer">
-            <p>Report generated by Company Image Sentiment Analyzer v7</p>
-            <p>Pluggable engine (Gemini / Claude / FinBERT) · pasted-text analysis · near-tie neutral disambiguation · finance false-negative guard · per-chunk diagnostics · word-boundary excerpts · CB-gated headline-first · scored-text display · CB-focused text · CB mention gate · corrupted-content voiding · paywall detection</p>
+            <p>Report generated by Company Image Sentiment Analyzer v8</p>
+            <p>Pluggable engine (Gemini / Claude / FinBERT) · syndicated-PR coverage detection · pasted-text analysis · near-tie neutral disambiguation · finance false-negative guard · per-chunk diagnostics · word-boundary excerpts · CB-gated headline-first · scored-text display · CB-focused text · CB mention gate · corrupted-content voiding · paywall detection</p>
         </div>
     </body>
     </html>
@@ -1405,7 +1472,7 @@ def create_pdf_report(results):
 
         # ---- Footer note ----
         pdf.ln(2)
-        line("Report generated by Company Image Sentiment Analyzer v7", size=8, color=(120, 120, 120))
+        line("Report generated by Company Image Sentiment Analyzer v8", size=8, color=(120, 120, 120))
 
         out = pdf.output()  # fpdf2 >= 2.x returns a bytearray
         return bytes(out)
@@ -1580,6 +1647,8 @@ def main():
             "**Near-tie → neutral:** a barely-negative-over-neutral split is reported "
             "as neutral, not negative.\n\n"
             "**Finance guard:** capital-raise language no longer drags a chunk negative.\n\n"
+            "**Syndicated-PR catch:** a CB release reposted verbatim on a third-party "
+            "site is classified Proactive, not Earned (applies to all three engines).\n\n"
             "**CB focus:** sentiment reflects how the article feels about CrossBoundary.\n\n"
             "**Scored text shown:** the report displays the exact text the engine read."
         )
@@ -1605,7 +1674,9 @@ def main():
     # ============================================================== #
     # v7: pick the active engine. All three share analyze_url() /
     # analyze_text() and return the SAME result shape, so everything
-    # downstream (exports, UI, coverage) is unchanged.
+    # downstream (exports, UI, coverage) is unchanged. The LLM engines
+    # delegate coverage typing to analyzer.classify_coverage_type(), so the
+    # v8 syndicated-PR catch applies to every engine automatically.
     # ============================================================== #
     if engine_choice.startswith("Gemini"):
         engine = FreeAnalyzer(helper=analyzer, provider="Gemini (Google AI Studio)")
