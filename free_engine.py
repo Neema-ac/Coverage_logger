@@ -30,7 +30,7 @@ import json
 import re
 import streamlit as st
 
-from claude_engine import ClaudeAnalyzer, CLAUDE_SYSTEM
+from claude_engine import ClaudeAnalyzer, CLAUDE_SYSTEM, _coerce_json
 
 try:
     from openai import OpenAI
@@ -91,15 +91,22 @@ class FreeAnalyzer(ClaudeAnalyzer):
         if url:
             user += f"\n\n(Source URL: {url})"
 
-        resp = self.client.chat.completions.create(
+        kwargs = dict(
             model=self.model,
-            max_tokens=1000,
+            max_tokens=2000,
             messages=[
                 {"role": "system", "content": CLAUDE_SYSTEM},
                 {"role": "user", "content": user},
             ],
         )
-        raw = (resp.choices[0].message.content or "")
-        raw = raw.replace("```json", "").replace("```", "").strip()
-        m = re.search(r"\{[\s\S]*\}", raw)
-        return json.loads(m.group(0) if m else raw)
+        # Gemini / Groq / most OpenRouter models support JSON mode, which
+        # prevents truncated/invalid JSON. Fall back if a model rejects it.
+        try:
+            resp = self.client.chat.completions.create(
+                response_format={"type": "json_object"}, **kwargs
+            )
+        except Exception:
+            resp = self.client.chat.completions.create(**kwargs)
+
+        raw = resp.choices[0].message.content or ""
+        return _coerce_json(raw)
