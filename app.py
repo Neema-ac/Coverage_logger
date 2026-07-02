@@ -1,4 +1,6 @@
-# Company Image Sentiment Analyzer  (CB-tuned, v8 — syndicated-PR detection)
+# Company Image Sentiment Analyzer  (CB-tuned, v9 — Organic/Proactive/
+#                                     Syndicated/Paid taxonomy + outlet/
+#                                     reporter/geo fields)
 # ------------------------------------------------------------------
 # Install:
 #   pip install streamlit trafilatura transformers torch beautifulsoup4 requests pandas reportlab fpdf2 anthropic openai
@@ -6,13 +8,18 @@
 # Run:
 #   streamlit run app.py
 #
-# v8 change: coverage-type classification now catches SYNDICATED press
-#   releases — a CB release reposted verbatim on a third-party news site is
-#   routed to Proactive instead of being mislabeled Earned. Because the two
-#   LLM engines (Claude, Gemini) delegate coverage typing to this file's
-#   classify_coverage_type(), this single change fixes all three engines.
+# v9 change: coverage type is now MULTI-LABEL across a new 5-tag taxonomy —
+#   Organic, Proactive, Syndicated, Paid, Unknown — replacing the old
+#   Owned/Proactive/Earned/Unknown scheme. An article can carry more than
+#   one tag (e.g. a paid syndicated repost). CB-owned-domain content is no
+#   longer classified here (tracked in a separate system). Also adds three
+#   new extracted fields: Outlet name, Reporter byline, and Geographic
+#   Reach (manual-entry, since reach isn't reliably inferable from a single
+#   article). Pasted-text mode gains two manual override inputs — "Did CB
+#   pitch this?" and "Paid placement?" — that take precedence over the
+#   heuristics. URL batch mode remains heuristics-only.
 #
-# v7 change: the analysis "engine" is now selectable in the sidebar.
+# v8 change: the analysis "engine" is now selectable in the sidebar.
 #   - Gemini (free tier)  -> free LLM, matches your Claude artifact closely
 #   - Claude (paid)       -> same reputational-sentiment prompt as the artifact
 #   - FinBERT (local)     -> the original, fully offline, no API
@@ -165,18 +172,43 @@ GENUINE_NEGATIVE_CUES = [
 ]
 
 # ------------------------------------------------------------------ #
-# Coverage type classification constants
+# Coverage type classification constants (v9 taxonomy)
 # ------------------------------------------------------------------ #
-CB_OWNED_DOMAINS = [
-    "crossboundary.com", "crossboundaryenergy.com",
-    "crossboundary.energy", "crossboundaryaccess.com",
-]
+# NOTE: CB-owned-domain content (crossboundary.com, etc.) is intentionally
+# NOT classified here anymore — it's tracked in a separate system per the
+# v9 taxonomy change. This tool now classifies everything else into:
+# Organic, Proactive, Syndicated, Paid, Unknown (multi-label — an article
+# can carry more than one tag).
+
+COVERAGE_ICONS = {
+    'Organic': '📰',
+    'Proactive': '📣',
+    'Syndicated': '🔁',
+    'Paid': '💰',
+    'Unknown': '❓',
+}
+# Kept for backward-compatible sorting/coloring lookups elsewhere in the UI.
+COVERAGE_TYPE_ORDER = ['Organic', 'Proactive', 'Syndicated', 'Paid', 'Unknown']
+
+
+def coverage_types(result):
+    """v9: 'coverage' is now a LIST of tag dicts. Returns the list of type
+    strings, e.g. ['Proactive', 'Paid']. Defensive against the old
+    single-dict shape in case any stale cached results are reloaded."""
+    cov = result.get('coverage', [])
+    if isinstance(cov, dict):
+        cov = [cov]
+    return [t.get('type', 'Unknown') for t in cov]
+
+
+def coverage_has(result, type_name):
+    return type_name in coverage_types(result)
 
 PR_WIRE_DOMAINS = [
     "prnewswire.com", "businesswire.com", "globenewswire.com",
     "accesswire.com", "prweb.com", "einpresswire.com", "newswire.com",
     "presswire.com", "send2press.com",
-    # v8: APO Group distribution domains (the wire CB uses across Africa)
+    # APO Group distribution domains (the wire CB uses across Africa)
     "apo-opa.com", "africa-newsroom.com",
 ]
 
@@ -201,12 +233,12 @@ PROACTIVE_PATTERNS = [
 ]
 
 # ------------------------------------------------------------------ #
-# Syndicated-PR detection (v8)
-# A release reposted VERBATIM on a third-party news site is NOT earned
+# Syndicated-PR detection (v8, carried into v9's "Syndicated" tag)
+# A release reposted VERBATIM on a third-party news site is NOT organic
 # editorial — it's CB-initiated content living on someone else's domain.
 # These BODY-TEXT cues catch reposts the URL-based PR_WIRE_DOMAINS check
-# misses (the repost URL is the news site, not the wire). High-precision
-# only, so a single hit can route to Proactive without misfiling earned.
+# misses (the repost URL is the news site, not the wire itself). High-
+# precision only, so a single hit can safely apply the tag.
 # ------------------------------------------------------------------ #
 SYNDICATION_WIRE_CUES = [
     (r'\bdistributed by\b[^.]{0,40}\bapo group\b', "wire credit: 'Distributed by APO Group'"),
@@ -225,6 +257,37 @@ SYNDICATION_CONTACT_PATTERNS = [
     (r'press\s+(?:contact|office|enquiries|inquiries)\b',     "press-contact block"),
     (r'for\s+(?:media|press)\s+(?:enquiries|inquiries|queries)\b', "press-enquiries line"),
 ]
+
+# ------------------------------------------------------------------ #
+# Paid-placement detection (v9)
+# High-precision sponsored/advertorial language, plus an extensible list
+# of domains known to run paid/native-advertising placements. Heuristics
+# only — no manual confirmation required in URL batch mode; pasted-text
+# mode additionally offers a manual "Paid placement?" override.
+# ------------------------------------------------------------------ #
+PAID_CUES = [
+    "sponsored content", "advertorial", "paid partnership",
+    "in partnership with", "promoted content", "paid post",
+    "brand voice", "paid content",
+]
+
+# Extend this list as you identify specific paid-placement outlets.
+PAID_DOMAINS = []
+
+# ------------------------------------------------------------------ #
+# Outlet / reporter extraction (v9)
+# Byline patterns used when structured meta tags aren't available.
+# ------------------------------------------------------------------ #
+BYLINE_PATTERNS = [
+    r'\bby\s+([A-Z][a-zA-Z.\'-]+(?:\s+[A-Z][a-zA-Z.\'-]+){0,3})\b',
+    r'\bwritten\s+by\s+([A-Z][a-zA-Z.\'-]+(?:\s+[A-Z][a-zA-Z.\'-]+){0,3})\b',
+    r'\breporting\s+by\s+([A-Z][a-zA-Z.\'-]+(?:\s+[A-Z][a-zA-Z.\'-]+){0,3})\b',
+]
+# Words that occasionally get false-matched as a "name" by the byline regex.
+_BYLINE_STOPWORDS = {
+    "the", "our", "staff", "reuters", "associated", "press", "editor",
+    "editors", "admin", "correspondent", "team", "newsroom",
+}
 
 
 @st.cache_resource
@@ -367,6 +430,69 @@ class EnhancedCompanyAnalyzer:
                 return cleaned
         return None
 
+    # ------------------------------------------------------------------ #
+    # v9: Outlet name + reporter extraction
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def _domain_to_outlet_name(url):
+        """Fallback outlet name derived from the domain, e.g.
+        'www.theeastafrican.co.ke' -> 'Theeastafrican'."""
+        if not url:
+            return None
+        m = re.search(r'https?://(?:www\.)?([^/]+)', url)
+        if not m:
+            return None
+        host = m.group(1)
+        core = host.split('.')[0]
+        core = re.sub(r'[-_]', ' ', core).strip()
+        return core.title() if core else None
+
+    def extract_outlet(self, soup, url):
+        """Best-effort outlet/publication name: og:site_name, then
+        <meta name="publisher">, then application-name, then domain."""
+        if soup:
+            og_site = soup.find('meta', property='og:site_name')
+            if og_site and og_site.get('content'):
+                return og_site.get('content').strip()[:100]
+            publisher = soup.find('meta', attrs={'name': 'publisher'})
+            if publisher and publisher.get('content'):
+                return publisher.get('content').strip()[:100]
+            app_name = soup.find('meta', attrs={'name': 'application-name'})
+            if app_name and app_name.get('content'):
+                return app_name.get('content').strip()[:100]
+        return self._domain_to_outlet_name(url)
+
+    def extract_reporter(self, soup, text):
+        """Best-effort reporter/byline: structured meta tags first
+        (author, article:author, twitter:creator), then a text-pattern
+        fallback ('By Jane Doe'). Returns None if nothing usable is found —
+        this is intentionally conservative rather than guessing."""
+        if soup:
+            for sel in (
+                {'name': 'author'},
+                {'property': 'article:author'},
+                {'name': 'twitter:creator'},
+                {'name': 'parsely-author'},
+            ):
+                tag = soup.find('meta', attrs=sel)
+                if tag and tag.get('content'):
+                    val = tag.get('content').strip()
+                    if val and not val.lower().startswith('http') and len(val) < 80:
+                        return val[:80]
+            rel_author = soup.find(attrs={'rel': 'author'})
+            if rel_author and rel_author.get_text(strip=True):
+                return rel_author.get_text(strip=True)[:80]
+
+        if text:
+            snippet = text[:600]
+            for pattern in BYLINE_PATTERNS:
+                m = re.search(pattern, snippet)
+                if m:
+                    name = m.group(1).strip()
+                    if name.lower().split()[0] not in _BYLINE_STOPWORDS:
+                        return name[:80]
+        return None
+
     def fetch_page_content(self, url):
         try:
             if not url.startswith(('http://', 'https://')):
@@ -427,6 +553,17 @@ class EnhancedCompanyAnalyzer:
 
             title = title or "Untitled Article"
 
+            # v9: outlet + reporter extraction (best-effort; soup may be None
+            # if trafilatura succeeded without needing a BeautifulSoup fallback,
+            # so build it here once, cheaply, just for these two fields).
+            if soup is None and html:
+                try:
+                    soup = BeautifulSoup(html, 'html.parser')
+                except Exception:
+                    soup = None
+            outlet = self.extract_outlet(soup, url)
+            reporter = self.extract_reporter(soup, text)
+
             sentences = re.split(r'(?<=[.!?])\s+', text)
             key_sentences = [s.strip() for s in sentences if len(s.strip()) > 60][:10]
 
@@ -436,7 +573,9 @@ class EnhancedCompanyAnalyzer:
                 'key_sentences': key_sentences,
                 'url': url,
                 'corrupted': corrupted,
-                'is_paywall': is_paywall
+                'is_paywall': is_paywall,
+                'outlet': outlet,
+                'reporter': reporter,
             }
 
         except Exception as e:
@@ -448,7 +587,9 @@ class EnhancedCompanyAnalyzer:
                 'url': url,
                 'error': str(e),
                 'corrupted': False,
-                'is_paywall': is_paywall
+                'is_paywall': is_paywall,
+                'outlet': None,
+                'reporter': None,
             }
 
     # ------------------------------------------------------------------ #
@@ -516,19 +657,15 @@ class EnhancedCompanyAnalyzer:
         return any(self._cb_sentence_match(s.lower()) for s in sentences)
 
     # ------------------------------------------------------------------ #
-    # Syndicated-PR detection (v8)
+    # Syndicated-PR detection (v8 logic, feeds the v9 "Syndicated" tag)
     # ------------------------------------------------------------------ #
     def _detect_syndicated_pr(self, text_lower):
         """Detect a syndicated/republished CB release on a third-party domain.
         Returns a reason string if detected, else None. High-precision cues
-        only, so genuine earned coverage isn't misrouted to Proactive."""
-        # Strong, single-hit cue: explicit wire / syndication attribution.
+        only, so genuine organic coverage isn't misrouted."""
         for pattern, label in SYNDICATION_WIRE_CUES:
             if re.search(pattern, text_lower):
                 return label
-        # Weaker cue: a contact block, but ONLY when it points back to CB
-        # (a CrossBoundary email/domain present) — that combination is PR,
-        # not editorial.
         has_cb_contact = (
             bool(re.search(r'crossboundary[\w.\-]*@|@[\w.\-]*crossboundary', text_lower))
             or 'crossboundary.com' in text_lower
@@ -540,43 +677,93 @@ class EnhancedCompanyAnalyzer:
         return None
 
     # ------------------------------------------------------------------ #
-    # Coverage type classification
+    # Paid-placement detection (v9)
     # ------------------------------------------------------------------ #
-    def classify_coverage_type(self, url, text, cb_mentioned):
+    def _detect_paid(self, text_lower, url_lower):
+        """Returns a reason string if paid-placement signals are found,
+        else None. Heuristics only — text cues or a known-paid domain."""
+        if any(domain in url_lower for domain in PAID_DOMAINS):
+            return "Published on a known paid-placement domain"
+        for cue in PAID_CUES:
+            if re.search(r'\b' + re.escape(cue) + r'\b', text_lower):
+                return f"Sponsored-content language detected: '{cue}'"
+        return None
+
+    # ------------------------------------------------------------------ #
+    # Coverage type classification (v9 — MULTI-LABEL)
+    # ------------------------------------------------------------------ #
+    def classify_coverage_type(self, url, text, cb_mentioned,
+                                manual_cb_pitched=None, manual_paid=None):
+        """Returns a LIST of tag dicts — {'type', 'icon', 'reason'} — since
+        an article can carry more than one coverage-type tag (e.g. a paid
+        syndicated repost gets both Paid and Syndicated).
+
+        `manual_cb_pitched` / `manual_paid`: optional True/False overrides
+        from the pasted-text mode UI. When set, they take precedence over
+        the corresponding heuristic instead of merely supplementing it.
+        CB-owned-domain content is NOT classified here (tracked separately).
+        """
         url_lower = (url or "").lower()
         text_lower = (text or "").lower()
 
-        if any(domain in url_lower for domain in CB_OWNED_DOMAINS):
-            return {'type': 'Owned', 'icon': '🏠',
-                    'reason': 'Published on a CrossBoundary-owned domain'}
-
-        if any(domain in url_lower for domain in PR_WIRE_DOMAINS):
-            return {'type': 'Owned', 'icon': '🏠',
-                    'reason': 'Distributed via a paid PR wire service'}
-
         if not text_lower:
-            return {'type': 'Unknown', 'icon': '❓',
-                    'reason': 'No article content available (paywalled or failed extraction)'}
+            return [{'type': 'Unknown', 'icon': COVERAGE_ICONS['Unknown'],
+                      'reason': 'No article content available (paywalled or failed extraction)'}]
 
         if not cb_mentioned:
-            return {'type': 'Unknown', 'icon': '❓',
-                    'reason': 'CrossBoundary not mentioned — coverage type indeterminate'}
+            return [{'type': 'Unknown', 'icon': COVERAGE_ICONS['Unknown'],
+                      'reason': 'CrossBoundary not mentioned — coverage type indeterminate'}]
 
-        for pattern, label in PROACTIVE_PATTERNS:
-            if re.search(pattern, text_lower):
-                return {'type': 'Proactive', 'icon': '📣',
-                        'reason': f'CB-initiated signal: {label}'}
+        tags = []
 
-        # v8: syndicated-PR catch — a verbatim release reposted on a third-
-        # party site. Runs BEFORE the Earned fallback so reposts don't inflate
-        # the Earned (independent-journalism) count.
+        # ---- Paid ----
+        if manual_paid is True:
+            tags.append({'type': 'Paid', 'icon': COVERAGE_ICONS['Paid'],
+                          'reason': 'Manually confirmed as a paid placement'})
+        elif manual_paid is None:
+            paid_reason = self._detect_paid(text_lower, url_lower)
+            if paid_reason:
+                tags.append({'type': 'Paid', 'icon': COVERAGE_ICONS['Paid'], 'reason': paid_reason})
+        # manual_paid is False -> explicitly suppressed, skip heuristic
+
+        # ---- Syndicated: repost of wire/PR content on a third-party site ----
+        is_wire_domain = any(domain in url_lower for domain in PR_WIRE_DOMAINS)
         syndication_reason = self._detect_syndicated_pr(text_lower)
-        if syndication_reason:
-            return {'type': 'Proactive', 'icon': '📣',
-                    'reason': f'Syndicated press release: {syndication_reason}'}
+        if syndication_reason and not is_wire_domain:
+            tags.append({'type': 'Syndicated', 'icon': COVERAGE_ICONS['Syndicated'],
+                          'reason': syndication_reason})
 
-        return {'type': 'Earned', 'icon': '📰',
-                'reason': 'CB mentioned in independent third-party coverage'}
+        # ---- Proactive: manual override, CB-initiated text signal, or the
+        #      article IS the wire posting itself ----
+        proactive_reason = None
+        if manual_cb_pitched is True:
+            proactive_reason = "Manually confirmed: CB pitched this to the outlet/reporter"
+        elif manual_cb_pitched is None:
+            if is_wire_domain:
+                proactive_reason = "Published directly on a PR wire distribution domain"
+            else:
+                for pattern, label in PROACTIVE_PATTERNS:
+                    if re.search(pattern, text_lower):
+                        proactive_reason = f"CB-initiated signal: {label}"
+                        break
+        # manual_cb_pitched is False -> explicitly suppressed, skip heuristic
+        if proactive_reason:
+            tags.append({'type': 'Proactive', 'icon': COVERAGE_ICONS['Proactive'],
+                          'reason': proactive_reason})
+
+        # ---- Organic: fallback when nothing above fired, OR manual "No" ----
+        if manual_cb_pitched is False or not any(t['type'] in ('Proactive', 'Syndicated') for t in tags):
+            already_organic = any(t['type'] == 'Organic' for t in tags)
+            if not already_organic:
+                reason = (
+                    "Manually confirmed: CB did not pitch this — reporter-initiated coverage"
+                    if manual_cb_pitched is False else
+                    "CB mentioned in independent, reporter-initiated coverage "
+                    "(no CB-pitch or syndication signal detected)"
+                )
+                tags.append({'type': 'Organic', 'icon': COVERAGE_ICONS['Organic'], 'reason': reason})
+
+        return tags
 
     # ------------------------------------------------------------------ #
     # CB-focused sentence selection
@@ -946,12 +1133,19 @@ class EnhancedCompanyAnalyzer:
     # ------------------------------------------------------------------ #
     # Shared analysis core — runs the SAME pipeline for URLs and pasted text
     # ------------------------------------------------------------------ #
-    def _analyze_content(self, url, title, text, key_sentences, headline_for_scoring=None):
+    def _analyze_content(self, url, title, text, key_sentences, headline_for_scoring=None,
+                          outlet=None, reporter=None, geographic_reach=None,
+                          manual_cb_pitched=None, manual_paid=None):
         """Run sentiment, alignment, outcomes and coverage on already-extracted
         content. `url` is used only for coverage-type domain checks (may be
         empty for pasted text). `headline_for_scoring` controls the headline-
         first stage: pass the real headline to enable it, or "" to skip it
-        (used by pasted text with no genuine headline)."""
+        (used by pasted text with no genuine headline).
+
+        v9: `outlet` / `reporter` / `geographic_reach` carry through to the
+        result for display/export. `manual_cb_pitched` / `manual_paid` are
+        optional True/False overrides that take precedence over the coverage
+        heuristics (used by pasted-text mode only)."""
         scoring_title = title if headline_for_scoring is None else headline_for_scoring
 
         sentiment = self.analyze_sentiment_with_explanation(text, title=scoring_title)
@@ -962,7 +1156,8 @@ class EnhancedCompanyAnalyzer:
             text, sentiment['label'], alignment['pillars']
         )
         coverage = self.classify_coverage_type(
-            url, text, cb_mentioned=sentiment.get('cb_mentioned', False)
+            url, text, cb_mentioned=sentiment.get('cb_mentioned', False),
+            manual_cb_pitched=manual_cb_pitched, manual_paid=manual_paid,
         )
 
         return {
@@ -970,7 +1165,9 @@ class EnhancedCompanyAnalyzer:
             'error': False, 'paywall': False, 'corrupted': False,
             'sentiment': sentiment, 'alignment': alignment, 'outcomes': outcomes,
             'coverage': coverage, 'key_sentences': key_sentences[:5],
-            'text_preview': text[:300] + "..."
+            'text_preview': text[:300] + "...",
+            'outlet': outlet, 'reporter': reporter,
+            'geographic_reach': geographic_reach,
         }
 
     # ------------------------------------------------------------------ #
@@ -992,9 +1189,11 @@ class EnhancedCompanyAnalyzer:
                               'explanation': 'Paywalled — content unavailable', 'matches': []},
                 'outcomes': {'outcomes': [], 'cb_mentioned': False,
                              'explanation': 'Paywalled — manual entry required'},
-                'coverage': {'type': 'Unknown', 'icon': '❓',
-                             'reason': 'Paywalled — content unavailable'},
-                'key_sentences': []
+                'coverage': [{'type': 'Unknown', 'icon': COVERAGE_ICONS['Unknown'],
+                             'reason': 'Paywalled — content unavailable'}],
+                'key_sentences': [],
+                'outlet': page_data.get('outlet'), 'reporter': page_data.get('reporter'),
+                'geographic_reach': None,
             }
 
         if page_data.get('corrupted') or not page_data['text']:
@@ -1013,8 +1212,10 @@ class EnhancedCompanyAnalyzer:
                               'explanation': explanation},
                 'alignment': {'status': 'NO', 'score': 0, 'explanation': explanation, 'matches': []},
                 'outcomes': {'outcomes': [], 'cb_mentioned': False, 'explanation': explanation},
-                'coverage': {'type': 'Unknown', 'icon': '❓', 'reason': explanation},
-                'key_sentences': []
+                'coverage': [{'type': 'Unknown', 'icon': COVERAGE_ICONS['Unknown'], 'reason': explanation}],
+                'key_sentences': [],
+                'outlet': page_data.get('outlet'), 'reporter': page_data.get('reporter'),
+                'geographic_reach': None,
             }
 
         return self._analyze_content(
@@ -1023,23 +1224,36 @@ class EnhancedCompanyAnalyzer:
             text=page_data['text'],
             key_sentences=page_data['key_sentences'],
             headline_for_scoring=None,  # use the extracted title as a real headline
+            outlet=page_data.get('outlet'),
+            reporter=page_data.get('reporter'),
+            geographic_reach=None,  # not auto-derivable; URL batch mode is heuristics-only
         )
 
     # ------------------------------------------------------------------ #
-    # Orchestration — PASTED TEXT path (v6)
+    # Orchestration — PASTED TEXT path (v6, v9 adds manual override fields)
     # ------------------------------------------------------------------ #
-    def analyze_text(self, raw_text, headline="", source_url=""):
+    def analyze_text(self, raw_text, headline="", source_url="",
+                      outlet="", reporter="", geographic_reach="",
+                      manual_cb_pitched=None, manual_paid=None):
         """Run the full analysis pipeline on user-pasted article text.
 
         Mirrors `analyze_url` but skips fetching. `headline` is optional: if
         provided it feeds the CB-gated headline-first stage exactly as a real
         headline would; if blank, scoring uses the body only (the auto display
         title is NOT scored, so it can't short-circuit the result).
-        `source_url` is optional and used only for Owned/PR-wire coverage
-        detection."""
+        `source_url` is optional and used only for PR-wire coverage detection.
+
+        v9: `outlet` / `reporter` / `geographic_reach` are manual text fields
+        (there's no page to scrape in paste mode). `manual_cb_pitched`
+        (True/False/None) and `manual_paid` (True/False/None) override the
+        coverage heuristics when set to True or False; leave as None to use
+        heuristics only."""
         text = re.sub(r'\s+', ' ', (raw_text or "")).strip()
         headline = (headline or "").strip()
         source_url = (source_url or "").strip()
+        outlet = (outlet or "").strip() or None
+        reporter = (reporter or "").strip() or None
+        geographic_reach = (geographic_reach or "").strip() or None
 
         # ---- Too short to analyze: return an error-shaped result ----
         if len(text) < 50:
@@ -1056,8 +1270,9 @@ class EnhancedCompanyAnalyzer:
                               'finance_guard_fired': False, 'explanation': explanation},
                 'alignment': {'status': 'NO', 'score': 0, 'explanation': explanation, 'matches': []},
                 'outcomes': {'outcomes': [], 'cb_mentioned': False, 'explanation': explanation},
-                'coverage': {'type': 'Unknown', 'icon': '❓', 'reason': explanation},
-                'key_sentences': []
+                'coverage': [{'type': 'Unknown', 'icon': COVERAGE_ICONS['Unknown'], 'reason': explanation}],
+                'key_sentences': [],
+                'outlet': outlet, 'reporter': reporter, 'geographic_reach': geographic_reach,
             }
 
         # ---- Display title: headline if given, else first words of the body ----
@@ -1082,6 +1297,8 @@ class EnhancedCompanyAnalyzer:
             text=text,
             key_sentences=key_sentences,
             headline_for_scoring=headline,   # "" => headline-first stage is skipped
+            outlet=outlet, reporter=reporter, geographic_reach=geographic_reach,
+            manual_cb_pitched=manual_cb_pitched, manual_paid=manual_paid,
         )
         # Mark the URL field nicely when no source was supplied.
         if not source_url:
@@ -1132,20 +1349,22 @@ def create_html_report(results):
             .badge-review {{ background: #f39c12; color: white; padding: 1px 7px; border-radius: 10px; font-size: 10px; margin-left: 6px; }}
             .badge-paywall {{ background: #e74c3c; color: white; padding: 1px 7px; border-radius: 10px; font-size: 10px; margin-left: 6px; }}
             .badge-cb {{ background: #27ae60; color: white; padding: 1px 7px; border-radius: 10px; font-size: 10px; margin-left: 6px; }}
-            .coverage-owned {{ color: #2980b9; font-weight: bold; }}
+            .coverage-organic {{ color: #27ae60; font-weight: bold; }}
             .coverage-proactive {{ color: #8e44ad; font-weight: bold; }}
-            .coverage-earned {{ color: #27ae60; font-weight: bold; }}
+            .coverage-syndicated {{ color: #d68910; font-weight: bold; }}
+            .coverage-paid {{ color: #c0392b; font-weight: bold; }}
             .coverage-unknown {{ color: #95a5a6; font-weight: bold; }}
         </style>
     </head>
     <body>
         <h1>🏢 Company Image Sentiment Analysis Report</h1>
         <p><strong>Generated:</strong> {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}</p>
-        <p><em>v8 — pluggable analysis engine (Gemini / Claude / FinBERT) with syndicated-PR
-        coverage detection. LLM engines use the same reputational-sentiment prompt as the Claude
-        artifact and delegate coverage typing to the rule-based classifier; FinBERT path retains
-        v6 pasted-text analysis, v5 near-tie neutral disambiguation, finance false-negative guard,
-        per-chunk diagnostics, and word-boundary excerpts.</em></p>
+        <p><em>v9 — Organic / Proactive / Syndicated / Paid / Unknown coverage taxonomy
+        (multi-label — an article can carry more than one tag), with Outlet, Reporter, and
+        Geographic Reach fields. LLM engines use the same reputational-sentiment prompt as
+        the Claude artifact and delegate coverage typing to the rule-based classifier;
+        FinBERT path retains v6 pasted-text analysis, v5 near-tie neutral disambiguation,
+        finance false-negative guard, per-chunk diagnostics, and word-boundary excerpts.</em></p>
 
         <div class="summary">
             <h2>Executive Summary</h2>
@@ -1169,15 +1388,20 @@ def create_html_report(results):
         neg_count = sum(1 for r in successful if r['sentiment']['label'] == 'negative')
         neu_count = sum(1 for r in successful if r['sentiment']['label'] == 'neutral')
         aligned_count = sum(1 for r in successful if r['alignment']['status'] == 'YES')
-        owned_count = sum(1 for r in results if r.get('coverage', {}).get('type') == 'Owned')
-        proactive_count = sum(1 for r in results if r.get('coverage', {}).get('type') == 'Proactive')
-        earned_count = sum(1 for r in results if r.get('coverage', {}).get('type') == 'Earned')
+        organic_count = sum(1 for r in results if coverage_has(r, 'Organic'))
+        proactive_count = sum(1 for r in results if coverage_has(r, 'Proactive'))
+        syndicated_count = sum(1 for r in results if coverage_has(r, 'Syndicated'))
+        paid_count = sum(1 for r in results if coverage_has(r, 'Paid'))
 
         html_content += f"<p><strong>Positive Sentiment:</strong> {pos_count}</p>"
         html_content += f"<p><strong>Negative Sentiment:</strong> {neg_count}</p>"
         html_content += f"<p><strong>Neutral Sentiment:</strong> {neu_count}</p>"
         html_content += f"<p><strong>Strong Alignment:</strong> {aligned_count}</p>"
-        html_content += f"<p><strong>🏠 Owned:</strong> {owned_count} &nbsp; <strong>📣 Proactive:</strong> {proactive_count} &nbsp; <strong>📰 Earned:</strong> {earned_count}</p>"
+        html_content += (f"<p><strong>📰 Organic:</strong> {organic_count} &nbsp; "
+                          f"<strong>📣 Proactive:</strong> {proactive_count} &nbsp; "
+                          f"<strong>🔁 Syndicated:</strong> {syndicated_count} &nbsp; "
+                          f"<strong>💰 Paid:</strong> {paid_count} "
+                          f"<span style='font-size:0.85em;color:#666;'>(articles can carry more than one tag)</span></p>")
 
     html_content += "</div>"
 
@@ -1215,8 +1439,19 @@ def create_html_report(results):
         cb_flag = result['outcomes'].get('cb_mentioned', False)
         cb_relevance = result['sentiment'].get('cb_relevance', 0)
         focus_mode = result['sentiment'].get('focus_mode', 'full')
-        coverage = result.get('coverage', {'type': 'Unknown', 'icon': '❓', 'reason': ''})
-        coverage_class = f"coverage-{coverage['type'].lower()}"
+        coverage_tags = result.get('coverage', [{'type': 'Unknown', 'icon': '❓', 'reason': ''}])
+        if isinstance(coverage_tags, dict):
+            coverage_tags = [coverage_tags]
+        coverage_tags_html = " ".join(
+            f'<span class="coverage-{t["type"].lower()}">{t["icon"]} {t["type"].upper()}</span>'
+            for t in coverage_tags
+        )
+        coverage_reasons_html = "".join(
+            f"<li><strong>{t['icon']} {t['type']}:</strong> {t['reason']}</li>" for t in coverage_tags
+        )
+        outlet_val = result.get('outlet') or 'Not identified'
+        reporter_val = result.get('reporter') or 'Not identified'
+        geo_val = result.get('geographic_reach') or 'Not specified'
 
         review_badge = '<span class="badge-review">⚠️ NEEDS REVIEW</span>' if needs_review_flag else ''
         cb_badge = '<span class="badge-cb">CB MENTIONED</span>' if cb_flag else ''
@@ -1233,11 +1468,13 @@ def create_html_report(results):
         <div class="article">
             <h3>{idx}. {result['title']} {review_badge} {cb_badge}</h3>
             <p><strong>URL:</strong> <a href="{result['url']}">{result['url']}</a></p>
+            <p><strong>Outlet:</strong> {outlet_val} &nbsp;|&nbsp; <strong>Reporter:</strong> {reporter_val}
+               &nbsp;|&nbsp; <strong>Geographic reach:</strong> {geo_val}</p>
 
             <h4>📡 Coverage Type</h4>
             <div class="explanation">
-                <p><strong>Type:</strong> <span class="{coverage_class}">{coverage['icon']} {coverage['type'].upper()}</span></p>
-                <p><strong>Reason:</strong> {coverage['reason']}</p>
+                <p><strong>Type(s):</strong> {coverage_tags_html}</p>
+                <ul>{coverage_reasons_html}</ul>
             </div>
 
             <h4>🎭 Sentiment Analysis</h4>
@@ -1302,8 +1539,8 @@ def create_html_report(results):
 
     html_content += """
         <div class="footer">
-            <p>Report generated by Company Image Sentiment Analyzer v8</p>
-            <p>Pluggable engine (Gemini / Claude / FinBERT) · syndicated-PR coverage detection · pasted-text analysis · near-tie neutral disambiguation · finance false-negative guard · per-chunk diagnostics · word-boundary excerpts · CB-gated headline-first · scored-text display · CB-focused text · CB mention gate · corrupted-content voiding · paywall detection</p>
+            <p>Report generated by Company Image Sentiment Analyzer v9</p>
+            <p>Organic/Proactive/Syndicated/Paid/Unknown multi-label coverage taxonomy · Outlet/Reporter/Geographic Reach fields · pluggable engine (Gemini / Claude / FinBERT) · pasted-text analysis · near-tie neutral disambiguation · finance false-negative guard · per-chunk diagnostics · word-boundary excerpts · CB-gated headline-first · scored-text display · CB-focused text · CB mention gate · corrupted-content voiding · paywall detection</p>
         </div>
     </body>
     </html>
@@ -1401,12 +1638,14 @@ def create_pdf_report(results):
             neg = sum(1 for r in successful if r['sentiment']['label'] == 'negative')
             neu = sum(1 for r in successful if r['sentiment']['label'] == 'neutral')
             aligned = sum(1 for r in successful if r['alignment']['status'] == 'YES')
-            owned = sum(1 for r in results if r.get('coverage', {}).get('type') == 'Owned')
-            proactive = sum(1 for r in results if r.get('coverage', {}).get('type') == 'Proactive')
-            earned = sum(1 for r in results if r.get('coverage', {}).get('type') == 'Earned')
+            organic = sum(1 for r in results if coverage_has(r, 'Organic'))
+            proactive = sum(1 for r in results if coverage_has(r, 'Proactive'))
+            syndicated = sum(1 for r in results if coverage_has(r, 'Syndicated'))
+            paid = sum(1 for r in results if coverage_has(r, 'Paid'))
             line(f"Sentiment - Positive: {pos}   Negative: {neg}   Neutral: {neu}", size=10)
             line(f"Strong alignment: {aligned}", size=10)
-            line(f"Coverage - Owned: {owned}   Proactive: {proactive}   Earned: {earned}", size=10)
+            line(f"Coverage - Organic: {organic}   Proactive: {proactive}   "
+                 f"Syndicated: {syndicated}   Paid: {paid}  (tags can overlap)", size=10)
         pdf.ln(3)
 
         # ---- Per-article detail ----
@@ -1416,6 +1655,11 @@ def create_pdf_report(results):
             # Article heading
             line(f"{idx}. {title}", size=11, style="B", color=(51, 51, 51), height=6)
             line("URL: " + result.get('url', ''), size=8, color=(90, 90, 110))
+            outlet_val = result.get('outlet') or 'Not identified'
+            reporter_val = result.get('reporter') or 'Not identified'
+            geo_val = result.get('geographic_reach') or 'Not specified'
+            line(f"Outlet: {outlet_val}   Reporter: {reporter_val}   Geographic reach: {geo_val}",
+                 size=8, color=(90, 90, 110))
 
             if result.get('paywall'):
                 line("PAYWALL - manual entry required after reading the article directly.",
@@ -1430,9 +1674,12 @@ def create_pdf_report(results):
                 pdf.ln(3)
                 continue
 
-            coverage = result.get('coverage', {'type': 'Unknown', 'reason': ''})
-            label_line("Coverage type:", coverage.get('type', 'Unknown').upper(), size=9)
-            line("  " + coverage.get('reason', ''), size=8, color=(90, 90, 90))
+            cov_tags = result.get('coverage', [{'type': 'Unknown', 'reason': ''}])
+            if isinstance(cov_tags, dict):
+                cov_tags = [cov_tags]
+            label_line("Coverage type(s):", ", ".join(t.get('type', 'Unknown').upper() for t in cov_tags), size=9)
+            for t in cov_tags:
+                line(f"  - {t.get('type', 'Unknown')}: {t.get('reason', '')}", size=8, color=(90, 90, 90))
 
             sent = result['sentiment']
             sent_color = _PDF_COLORS.get(sent['label'], (34, 34, 34))
@@ -1472,7 +1719,7 @@ def create_pdf_report(results):
 
         # ---- Footer note ----
         pdf.ln(2)
-        line("Report generated by Company Image Sentiment Analyzer v8", size=8, color=(120, 120, 120))
+        line("Report generated by Company Image Sentiment Analyzer v9", size=8, color=(120, 120, 120))
 
         out = pdf.output()  # fpdf2 >= 2.x returns a bytearray
         return bytes(out)
@@ -1505,8 +1752,18 @@ def render_exports(results):
             'Alignment': r['alignment']['status'] if not r.get('error') else 'N/A',
             'Alignment Score': r['alignment'].get('score', 0) if not r.get('error') else 0,
             'CB Mentioned': r['outcomes'].get('cb_mentioned', False) if not r.get('error') else False,
-            'Coverage Type': r.get('coverage', {}).get('type', 'Unknown'),
-            'Coverage Reason': r.get('coverage', {}).get('reason', ''),
+            # v9: multi-label coverage — comma-separated for a flat CSV row.
+            # For a proper Power BI data model, split this into a bridge
+            # table (one row per Article-Coverage Tag) instead of parsing
+            # the comma-separated string in DAX — see notes below.
+            'Coverage Type(s)': ', '.join(coverage_types(r)),
+            'Coverage Reasons': ' | '.join(
+                f"{t.get('type')}: {t.get('reason', '')}"
+                for t in (r.get('coverage', []) if isinstance(r.get('coverage', []), list) else [r.get('coverage', {})])
+            ),
+            'Outlet': r.get('outlet') or '',
+            'Reporter': r.get('reporter') or '',
+            'Geographic Reach': r.get('geographic_reach') or '',
             'Outcomes': ', '.join([o['outcome'] for o in r['outcomes']['outcomes']]) if not r.get('error') and r['outcomes']['outcomes'] else '',
             'Paywall': r.get('paywall', False),
             'Explanation': r['sentiment']['explanation'] if not r.get('error') else ''
@@ -1647,10 +1904,23 @@ def main():
             "**Near-tie → neutral:** a barely-negative-over-neutral split is reported "
             "as neutral, not negative.\n\n"
             "**Finance guard:** capital-raise language no longer drags a chunk negative.\n\n"
-            "**Syndicated-PR catch:** a CB release reposted verbatim on a third-party "
-            "site is classified Proactive, not Earned (applies to all three engines).\n\n"
             "**CB focus:** sentiment reflects how the article feels about CrossBoundary.\n\n"
             "**Scored text shown:** the report displays the exact text the engine read."
+        )
+
+        st.markdown("---")
+        st.markdown("### 🏷️ Coverage Type Taxonomy (v9)")
+        st.info(
+            "**📰 Organic:** reporter-initiated coverage — no CB pitch or syndication signal detected.\n\n"
+            "**📣 Proactive:** CB reached out to the outlet/reporter, or the article sits directly "
+            "on a PR-wire distribution domain.\n\n"
+            "**🔁 Syndicated:** a press release reposted verbatim on a third-party site.\n\n"
+            "**💰 Paid:** sponsored/advertorial language or a known paid-placement domain.\n\n"
+            "**❓ Unknown:** no usable content, or CrossBoundary isn't mentioned.\n\n"
+            "Tags are **multi-label** — an article can carry more than one (e.g. a paid "
+            "syndicated repost). In pasted-text mode, the 'Did CB pitch this?' and "
+            "'Was this a paid placement?' fields override the heuristic when you set them; "
+            "URL batch mode is heuristics-only."
         )
 
         st.markdown("---")
@@ -1662,6 +1932,9 @@ def main():
             "- Download CSV and filter 'Needs Review = TRUE' first\n"
             "- Lower the threshold if too many true-positive CB articles get flagged\n"
             "- **Paste-text mode:** add a Headline only if the source actually has one\n"
+            "- **Paste-text mode:** set the manual coverage-type fields only when you're "
+            "certain — leave on auto-detect otherwise\n"
+            "- **Outlet/Reporter:** auto-scraped for URLs; enter manually for pasted text\n"
             "- **Privacy:** the free tier may train on your prompts — send public article text only"
         )
 
@@ -1674,9 +1947,7 @@ def main():
     # ============================================================== #
     # v7: pick the active engine. All three share analyze_url() /
     # analyze_text() and return the SAME result shape, so everything
-    # downstream (exports, UI, coverage) is unchanged. The LLM engines
-    # delegate coverage typing to analyzer.classify_coverage_type(), so the
-    # v8 syndicated-PR catch applies to every engine automatically.
+    # downstream (exports, UI, coverage) is unchanged.
     # ============================================================== #
     if engine_choice.startswith("Gemini"):
         engine = FreeAnalyzer(helper=analyzer, provider="Gemini (Google AI Studio)")
@@ -1756,7 +2027,8 @@ def main():
                 display_detailed_results(st.session_state.results)
 
     # ============================================================== #
-    # MODE 2 — Pasted text (v6, same pipeline)
+    # MODE 2 — Pasted text (v6 pipeline, v9 adds outlet/reporter/geo +
+    # manual coverage-type overrides)
     # ============================================================== #
     else:
         st.markdown("### 📋 Paste Article Text to Analyze")
@@ -1784,10 +2056,52 @@ def main():
         with col_b:
             pasted_source_url = st.text_input(
                 "Source URL (optional)",
-                placeholder="e.g. https://prnewswire.com/... or a CB-owned domain",
-                help="Used only to classify coverage type (Owned / PR-wire). "
-                     "Leave blank to let coverage type be inferred from the text alone."
+                placeholder="e.g. https://prnewswire.com/...",
+                help="Used only to help classify coverage type (e.g. detecting a PR-wire "
+                     "domain). Leave blank to let coverage type be inferred from the text alone."
             )
+
+        st.markdown("##### 🏷️ Outlet, Reporter & Reach (manual — no page to scrape in paste mode)")
+        col_c, col_d, col_e = st.columns(3)
+        with col_c:
+            pasted_outlet = st.text_input(
+                "Outlet name (optional)",
+                placeholder="e.g. The East African"
+            )
+        with col_d:
+            pasted_reporter = st.text_input(
+                "Reporter name (optional)",
+                placeholder="e.g. Jane Doe"
+            )
+        with col_e:
+            pasted_geo_reach = st.text_input(
+                "Geographic reach (optional)",
+                placeholder="e.g. Pan-African, Kenya-only, Global"
+            )
+
+        st.markdown("##### 📡 Coverage Type — manual overrides (optional)")
+        st.caption(
+            "Leave both on 'Not sure / auto-detect' to rely purely on the text heuristics. "
+            "Set an answer here only when you know it for certain — it overrides the heuristic."
+        )
+        col_f, col_g = st.columns(2)
+        with col_f:
+            cb_pitched_choice = st.selectbox(
+                "Did CrossBoundary pitch this to the outlet/reporter?",
+                ["Not sure / auto-detect", "Yes — CB pitched it (Proactive)", "No — reporter-initiated (Organic)"],
+                help="'Who reached out first' usually isn't stated in the article text, so "
+                     "the heuristic is best-effort. Set this manually when you know the answer."
+            )
+        with col_g:
+            paid_choice = st.selectbox(
+                "Was this a paid placement?",
+                ["Not sure / auto-detect", "Yes — paid placement", "No — not paid"],
+                help="Overrides the sponsored-content text-cue heuristic."
+            )
+
+        manual_cb_pitched = {"Yes — CB pitched it (Proactive)": True,
+                              "No — reporter-initiated (Organic)": False}.get(cb_pitched_choice, None)
+        manual_paid = {"Yes — paid placement": True, "No — not paid": False}.get(paid_choice, None)
 
         analyze_text_btn = st.button("🔍 Analyze Pasted Text", type="primary", use_container_width=True)
 
@@ -1797,6 +2111,11 @@ def main():
                     raw_text=pasted_text,
                     headline=pasted_headline,
                     source_url=pasted_source_url,
+                    outlet=pasted_outlet,
+                    reporter=pasted_reporter,
+                    geographic_reach=pasted_geo_reach,
+                    manual_cb_pitched=manual_cb_pitched,
+                    manual_paid=manual_paid,
                 )
             results = [result]
             st.session_state.results = results
@@ -1837,19 +2156,23 @@ def display_detailed_results(results):
         avg_confidence = sum(r['sentiment']['score'] for r in successful) / len(successful) if successful else 0
         st.metric("📊 Avg Confidence", f"{avg_confidence:.1%}")
 
-    col_a, col_b, col_c, col_d = st.columns(4)
+    col_a, col_b, col_c, col_d, col_e = st.columns(5)
     with col_a:
-        owned = sum(1 for r in results if r.get('coverage', {}).get('type') == 'Owned')
-        st.metric("🏠 Owned", owned)
+        organic = sum(1 for r in results if coverage_has(r, 'Organic'))
+        st.metric("📰 Organic", organic)
     with col_b:
-        proactive = sum(1 for r in results if r.get('coverage', {}).get('type') == 'Proactive')
+        proactive = sum(1 for r in results if coverage_has(r, 'Proactive'))
         st.metric("📣 Proactive", proactive)
     with col_c:
-        earned = sum(1 for r in results if r.get('coverage', {}).get('type') == 'Earned')
-        st.metric("📰 Earned", earned)
+        syndicated = sum(1 for r in results if coverage_has(r, 'Syndicated'))
+        st.metric("🔁 Syndicated", syndicated)
     with col_d:
-        unknown_cov = sum(1 for r in results if r.get('coverage', {}).get('type') == 'Unknown')
+        paid = sum(1 for r in results if coverage_has(r, 'Paid'))
+        st.metric("💰 Paid", paid)
+    with col_e:
+        unknown_cov = sum(1 for r in results if coverage_has(r, 'Unknown'))
         st.metric("❓ Unknown", unknown_cov)
+    st.caption("Tags can overlap — an article may carry more than one coverage type, so these can sum to more than the article count.")
 
     st.markdown("---")
 
@@ -1901,17 +2224,27 @@ def display_detailed_results(results):
                 continue
 
             st.markdown(f"**URL:** {result['url']}")
+            st.markdown(
+                f"**Outlet:** {result.get('outlet') or '_Not identified_'} &nbsp;|&nbsp; "
+                f"**Reporter:** {result.get('reporter') or '_Not identified_'} &nbsp;|&nbsp; "
+                f"**Geographic reach:** {result.get('geographic_reach') or '_Not specified_'}"
+            )
 
-            coverage = result.get('coverage', {'type': 'Unknown', 'icon': '❓', 'reason': ''})
-            cov_colors = {'Owned': '#2980b9', 'Proactive': '#8e44ad',
-                          'Earned': '#27ae60', 'Unknown': '#95a5a6'}
-            cov_color = cov_colors.get(coverage['type'], '#95a5a6')
+            cov_colors = {'Organic': '#27ae60', 'Proactive': '#8e44ad',
+                          'Syndicated': '#d68910', 'Paid': '#c0392b', 'Unknown': '#95a5a6'}
+            cov_tags = result.get('coverage', [{'type': 'Unknown', 'icon': '❓', 'reason': ''}])
+            if isinstance(cov_tags, dict):
+                cov_tags = [cov_tags]
+            tag_badges = " ".join(
+                f'<span style="color:{cov_colors.get(t["type"], "#95a5a6")}; font-weight:bold;">'
+                f'{t["icon"]} {t["type"].upper()}</span>'
+                for t in cov_tags
+            )
+            reasons_list = "".join(f"<li>{t['icon']} <strong>{t['type']}:</strong> {t['reason']}</li>" for t in cov_tags)
             st.markdown(f"""
             <div class="explanation-box">
-                <strong>📡 Coverage Type:</strong>
-                <span style="color:{cov_color}; font-weight:bold;">
-                {coverage['icon']} {coverage['type'].upper()}</span>
-                &nbsp;—&nbsp; {coverage['reason']}
+                <strong>📡 Coverage Type(s):</strong> {tag_badges}
+                <ul>{reasons_list}</ul>
             </div>
             """, unsafe_allow_html=True)
 
